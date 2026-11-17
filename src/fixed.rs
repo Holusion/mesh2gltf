@@ -12,6 +12,11 @@ use serde_json::{json, Value};
 /// An `i64` at this scale spans roughly ±9.2e8 m, which covers any projected coordinate system.
 pub const SCALE: i128 = 10_000_000_000;
 
+/// Significant bits float32 must keep across a model's largest dimension before
+/// [`BBox::far_origin`] moves the model: 1/65,536 of its size, 8 bits short of what float32 holds
+/// for a model around 0. Tighter would move models that lose nothing visible.
+const KEPT_BITS: i32 = 16;
+
 /// Parse decimal and scientific notation exactly, rounding to 10 fractional digits.
 /// Subtraction stays in integers until local coordinates are encoded as float32.
 pub fn parse_decimal_fixed(s: &str) -> crate::Res<i64> {
@@ -192,6 +197,43 @@ impl BBox {
         ])
     }
 
+    /// The origin positions must be stored relative to, so that float32 keeps their detail, or
+    /// `None` when they are close enough to 0 as they are.
+    ///
+    /// float32 resolves 24 significant bits. A model away from 0 compared with its size, typically
+    /// georeferenced, spends some of them on its distance to 0. The model is moved once fewer than
+    /// [`KEPT_BITS`] would remain across its largest dimension. A model a few kilometres across
+    /// with local coordinates is never moved; a building in projected coordinates always is.
+    ///
+    /// The origin is the box center rounded to the largest power of ten no larger than the model,
+    /// which costs at most one bit and keeps the origin a short decimal. A JSON reader, which parses
+    /// numbers as `f64`, then gets the origin back intact as a node translation.
+    pub fn far_origin(&self) -> Option<[i64; 3]> {
+        let (min, max) = self.bounds?;
+        let size = self.size()?.into_iter().max()?;
+        let reach = (0..3)
+            .map(|i| (min[i] as i128).abs().max((max[i] as i128).abs()))
+            .max()?;
+        if reach == 0 {
+            return None;
+        }
+        let metres = |v: i128| v as f64 / SCALE as f64;
+        // Spacing between consecutive float32 values at `reach`.
+        let spacing = 2f64.powi(metres(reach).log2().floor() as i32 - 23);
+        if spacing * 2f64.powi(KEPT_BITS) <= metres(size) {
+            return None;
+        }
+        let mut step = 1i128;
+        while step * 10 <= size {
+            step *= 10;
+        }
+        let center = self.center()?;
+        Some(center.map(|c| {
+            let rounded = (c as i128 + step / 2).div_euclid(step) * step;
+            i64::try_from(rounded).unwrap_or(c)
+        }))
+    }
+
     /// `min → max`, for human-readable output.
     pub fn range_str(&self) -> Option<String> {
         let (min, max) = self.bounds?;
@@ -320,6 +362,49 @@ mod tests {
         assert_eq!(b.range_str().unwrap(), "-1 0 -2.5 → 3 0 2.5");
         assert_eq!(format_triple(b.center().unwrap()), "1 0 0");
         assert_eq!(b.size_str().unwrap(), "4 × 0 × 5");
+    }
+
+    fn far_origin(points: &[&str]) -> Option<String> {
+        let mut b = BBox::new();
+        for p in points {
+            b.add(parse_three_fixed(p).unwrap());
+        }
+        b.far_origin().map(format_triple)
+    }
+
+    #[test]
+    fn local_coordinates_stay_in_place() {
+        // A 5 km site in local coordinates, even one not around 0.
+        assert_eq!(far_origin(&["0 0 0", "5000 4000 120"]), None);
+        assert_eq!(far_origin(&["2000 3000 0", "5000 4000 120"]), None);
+        // A 100 m building on a site grid a few kilometres wide.
+        assert_eq!(far_origin(&["5000 5000 0", "5100 5100 30"]), None);
+        // A 2 m object a hundred metres away.
+        assert_eq!(far_origin(&["100 0 0", "102 1 1"]), None);
+        // Nothing to place.
+        assert_eq!(far_origin(&[]), None);
+        assert_eq!(far_origin(&["0 0 0"]), None);
+    }
+
+    #[test]
+    fn georeferenced_coordinates_move_to_a_round_origin() {
+        // A 10 m building in Lambert-93: the center rounded to 10 m.
+        assert_eq!(
+            far_origin(&["651234.56 6862001.2 120", "651244.5 6862011.1 130"]),
+            Some("651240 6862010 130".into())
+        );
+        // A 3 km terrain in UTM: rounded to 1 km.
+        assert_eq!(
+            far_origin(&["500300 4999700 0", "503300 5002700 800"]),
+            Some("502000 5001000 0".into())
+        );
+        // A 2 cm object far away: rounded to 1 cm, negative coordinates rounding to nearest.
+        assert_eq!(
+            far_origin(&["-651234.567 0 0", "-651234.547 0.02 0.02"]),
+            Some("-651234.56 0.01 0.01".into())
+        );
+        // A single point away from 0 has no size to lose.
+        assert_eq!(far_origin(&["5 5 5"]), Some("5 5 5".into()));
     }
 
     #[test]

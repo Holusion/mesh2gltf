@@ -185,10 +185,14 @@ fn write_with_limit(
     let output = &options.output;
     let (center, z_up) = (options.center, options.z_up);
     let transparency = crate::images::scan_transparency(&images);
-    let origin = if center {
-        scene.bbox.center().ok_or("No vertices to center")?
+    // Positions are stored relative to `origin`. A model far from 0 keeps its place through a
+    // node translation; `--center` drops it instead.
+    let (origin, translated) = if center {
+        (scene.bbox.center().ok_or("No vertices to center")?, false)
+    } else if let Some(origin) = scene.bbox.far_origin() {
+        (origin, true)
     } else {
-        [0; 3]
+        ([0; 3], false)
     };
     crate::say!("Origin: {}", format_triple(origin));
     crate::say!(
@@ -208,8 +212,8 @@ fn write_with_limit(
     if document.offset == 0 {
         return Err("Input contains no supported triangle geometry".into());
     }
-    if !center {
-        crate::say!("Note: coordinates were encoded as float32 without recentering; use --center for georeferenced assets");
+    if translated {
+        crate::say!("Note: the model is far from 0 for its size; positions are relative to the origin, which each node's translation restores (--center drops it)");
     }
     let transparent = transparency
         .join()
@@ -223,6 +227,16 @@ fn write_with_limit(
         parent(output),
         &mut outputs,
     )?;
+    // glTF applies the rotation first, so the translation is the origin in output axes. Parsed
+    // from its decimal text, it is the `f64` a JSON reader gets from the origin.
+    let translation = translated.then(|| {
+        let o = if z_up {
+            [origin[0], origin[2], -origin[1]]
+        } else {
+            origin
+        };
+        o.map(|v| format_fixed_as_decimal(v).parse::<f64>().unwrap())
+    });
     let mut meshes = Vec::new();
     let mut nodes = Vec::new();
     for mesh in document.meshes {
@@ -231,6 +245,9 @@ fn write_with_limit(
             if z_up {
                 let q = std::f64::consts::FRAC_1_SQRT_2;
                 node["rotation"] = json!([-q, 0., 0., q]);
+            }
+            if let Some(t) = translation {
+                node["translation"] = json!(t);
             }
             nodes.push(node);
             meshes.push(mesh);
@@ -382,7 +399,7 @@ fn geometry(
             }
             vertices.push(v);
         }
-        // Translate relative to first corner for stable polygon calculations even without --center.
+        // Translate relative to first corner for stable polygon calculations wherever the face lies.
         let anchor = positions[0];
         for p in &mut positions {
             for i in 0..3 {

@@ -13,8 +13,8 @@ cargo install --path . --locked
 
 ```sh
 mesh2gltf model.obj
-mesh2gltf terrain.obj --center -o terrain.gltf
-mesh2gltf terrain.wrl --center --up-axis z -o terrain.gltf
+mesh2gltf terrain.wrl --up-axis z -o terrain.gltf
+mesh2gltf building.obj --center
 ```
 
 A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any copied or converted textures. By default, the output uses the input's name with a `.gltf` extension. The destination directory must already exist; existing output files are never overwritten. A failed conversion removes only output files it created.
@@ -23,7 +23,7 @@ A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any cop
 mesh2gltf [OPTIONS] <file.obj|file.wrl|file.vrml>
 
 -o, --output FILE  Destination .gltf (default: input with .gltf extension)
-    --center       Subtract the whole-input bounding-box center
+    --center       Move the bounding-box center to 0, dropping the model's position
     --up-axis AXIS Source up axis: y (default) or z
     --tmp-dir DIR  Workspace directory (default: the output's directory)
     --keep-tmp     Preserve the workspace for debugging
@@ -62,7 +62,7 @@ Codes 3 and 4 mean the file itself may be fine, and a retry elsewhere can succee
 ## Working with large or georeferenced models
 
 - Keep the workspace on a real disk with ample free space. It defaults to the output directory; use `--tmp-dir` to choose another location. An SSD helps with large models. Temporary files are cleaned up automatically.
-- Use `--center` to preserve local detail in georeferenced coordinates. The original origin is stored in the glTF metadata. Files centered independently have different origins, which must be accounted for to keep them aligned.
+- Georeferenced models need no option. A model far from 0 compared with its size, such as a building in projected coordinates, has its positions stored relative to a rounded origin near its center, and each node's translation puts it back in place. glTF's float32 positions keep the model's detail, and files converted separately stay aligned. `--center` drops that position instead, moving the model's center to 0. The origin is recorded in the glTF metadata either way.
 - Coordinates are assumed to be in metres. No coordinate-system reprojection or unit conversion is performed.
 - Material conversion approximates the source appearance. Unsupported data is generally omitted with a warning; VRML support covers a subset of IndexedFaceSet scenes.
 

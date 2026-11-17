@@ -82,6 +82,9 @@ fn exact_center_scientific_notation_and_ranges() {
         root["extras"]["mesh2gltf"]["origin"][0],
         "651234.5688901234"
     );
+    // `--center` drops the position rather than restoring it.
+    assert_eq!(root["extras"]["mesh2gltf"]["centered"], true);
+    assert!(root["nodes"][0].get("translation").is_none());
     assert_eq!(
         root["buffers"][0]["byteLength"].as_u64().unwrap(),
         bin.len() as u64
@@ -108,6 +111,93 @@ fn exact_center_scientific_notation_and_ranges() {
         assert_eq!(start % 4, 0);
         assert!(start + length <= bin.len() as u64);
     }
+}
+#[test]
+fn georeferenced_model_keeps_its_place() {
+    let f = Fixture::new();
+    // A 4 mm triangle in Lambert-93, where float32 resolves 0.5 m.
+    f.file("in.obj", "o a\nv 651234.5678 6862001.234 120.5\nv 651234.5718 6862001.234 120.5\nv 651234.5678 6862001.238 120.5\nf 1 2 3\no b\nf 3 2 1\n");
+    let result = f.import("in.obj", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("far from 0"));
+    let (root, bin) = f.result();
+    let extras = &root["extras"]["mesh2gltf"];
+    assert_eq!(
+        extras["origin"],
+        serde_json::json!(["651234.57", "6862001.236", "120.5"])
+    );
+    assert_eq!(extras["centered"], false);
+    for node in root["nodes"].as_array().unwrap() {
+        assert_eq!(
+            node["translation"],
+            serde_json::json!([651234.57, 6862001.236, 120.5])
+        );
+    }
+    let primitive = &root["meshes"][0]["primitives"][0];
+    let p = floats(
+        &root,
+        &bin,
+        primitive["attributes"]["POSITION"].as_u64().unwrap() as usize,
+        3,
+    );
+    // Positions keep the source's 0.1 mm digits relative to the origin.
+    let expected = [
+        [-0.0022, -0.002, 0.],
+        [0.0018, -0.002, 0.],
+        [-0.0022, 0.002, 0.],
+    ];
+    for (p, e) in p.iter().zip(expected) {
+        for i in 0..3 {
+            assert!((p[i] as f64 - e[i]).abs() < 1e-7, "{p:?} vs {e:?}");
+        }
+    }
+}
+#[test]
+fn georeferenced_z_up_translation_is_in_output_axes() {
+    let f = Fixture::new();
+    f.file(
+        "in.obj",
+        "v 651000 6862000 120\nv 651010 6862000 120\nv 651000 6862010 120\nf 1 2 3\n",
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
+        .arg(f.0.join("in.obj"))
+        .args(["--up-axis", "z", "-o"])
+        .arg(f.0.join("out.gltf"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, _) = f.result();
+    assert_eq!(
+        root["extras"]["mesh2gltf"]["origin"],
+        serde_json::json!(["651010", "6862010", "120"])
+    );
+    assert_eq!(
+        root["nodes"][0]["translation"],
+        serde_json::json!([651010.0, 120.0, -6862010.0])
+    );
+}
+#[test]
+fn local_model_has_no_translation() {
+    let f = Fixture::new();
+    f.file(
+        "in.obj",
+        "v 2000 3000 0\nv 5000 3000 0\nv 2000 4000 120\nf 1 2 3\n",
+    );
+    assert!(f.import("in.obj", false).status.success());
+    let (root, _) = f.result();
+    assert_eq!(
+        root["extras"]["mesh2gltf"]["origin"],
+        serde_json::json!(["0", "0", "0"])
+    );
+    assert!(root["nodes"][0].get("translation").is_none());
 }
 #[test]
 fn seams_materials_and_explicit_meshes() {
