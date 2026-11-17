@@ -1,6 +1,6 @@
 # mesh2gltf
 
-A Rust command-line tool for converting very large OBJ and VRML meshes to glTF 2.0. It handles georeferenced coordinates and models [larger than available RAM](https://github.com/Holusion/mesh2gltf/wiki/Resource-usage-comparison), using a disk workspace.
+A Rust command-line tool for converting very large OBJ, PLY and VRML meshes to glTF 2.0. It handles georeferenced coordinates and models [larger than available RAM](https://github.com/Holusion/mesh2gltf/wiki/Resource-usage-comparison), using a disk workspace.
 
 ## Install
 Download a binary from latest [release](https://github.com/Holusion/mesh2gltf/releases) or install from a repository checkout with [Rust and Cargo](https://www.rust-lang.org/tools/install):
@@ -13,6 +13,7 @@ cargo install --path . --locked
 
 ```sh
 mesh2gltf model.obj
+mesh2gltf scan.ply
 mesh2gltf terrain.wrl --up-axis z -o terrain.gltf
 mesh2gltf building.obj --center
 ```
@@ -20,7 +21,7 @@ mesh2gltf building.obj --center
 A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any copied or converted textures. By default, the output uses the input's name with a `.gltf` extension. The destination directory must already exist; existing output files are never overwritten. A failed conversion removes only output files it created.
 
 ```text
-mesh2gltf [OPTIONS] <file.obj|file.wrl|file.vrml>
+mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
 
 -o, --output FILE  Destination .gltf (default: input with .gltf extension)
     --center       Move the bounding-box center to 0, dropping the model's position
@@ -36,13 +37,13 @@ mesh2gltf [OPTIONS] <file.obj|file.wrl|file.vrml>
 
 Without arguments, mesh2gltf prints this help.
 
-Vertex colors (OBJ `v x y z r g b`, VRML `Color` nodes) are only written on faces without a texture, where they replace the material's diffuse color (`Kd` or `diffuseColor`). A texture replaces them, so they are dropped on textured faces. `--no-color` drops them everywhere, which keeps the material's own color.
+Vertex colors (OBJ `v x y z r g b`, PLY `red green blue`, VRML `Color` nodes) are only written on faces without a texture, where they replace the material's diffuse color (`Kd` or `diffuseColor`). A texture replaces them, so they are dropped on textured faces. `--no-color` drops them everywhere, which keeps the material's own color.
 
 JPG and PNG textures are used as they are. Other formats, such as BMP, TIFF, TGA or EXR, are converted to PNG, which is lossless and keeps alpha. Textures stay in place when input and output share a folder and no conversion is needed; otherwise they are copied. Source images are never modified.
 
 ## Models from other people
 
-By default, mesh2gltf only follows a file reference in a model (an OBJ `mtllib`, an MTL `map_Kd`, a VRML `url`) to a regular file inside the input's folder. A model can't read anything else on the machine, and a reference that fails gets the same message whether the file is missing or forbidden. A texture that can't be reached fails the conversion, as a missing one does. The output doesn't refer outside its own folder either, so `--images keep` is a command-line error (exit 2) if it would.
+By default, mesh2gltf only follows a file reference in a model (an OBJ `mtllib`, an MTL `map_Kd`, a PLY `comment TextureFile`, a VRML `url`) to a regular file inside the input's folder. A model can't read anything else on the machine, and a reference that fails gets the same message whether the file is missing or forbidden. A texture that can't be reached fails the conversion, as a missing one does. The output doesn't refer outside its own folder either, so `--images keep` is a command-line error (exit 2) if it would.
 
 A reference may use `..` as long as it stays inside the folder. URLs and symlinks leading out are refused. An absolute path, which old exporters often write where a relative one belongs, is only used to look for a file of that name beside the file containing the reference. `--trusted` turns this off for a model you know: references may then point anywhere, including through symlinks, the lookup by name is only used when the absolute path doesn't exist, and `--images keep` may refer to any folder.
 
@@ -53,7 +54,7 @@ Messages on stderr can be shown to whoever supplied the model. A file is shown b
 | Code | Meaning |
 | ---- | ------- |
 | 0 | Success |
-| 1 | The input was rejected, including an input that isn't `.obj`, `.wrl` or `.vrml` |
+| 1 | The input was rejected, including an input that isn't `.obj`, `.ply`, `.wrl` or `.vrml`, and a PLY without faces: point clouds aren't supported |
 | 2 | The command line is wrong, including `--images keep` with an output folder that doesn't hold the input's images |
 | 3 | A resource limit was reached: the disk is full, or a quota or file-size limit |
 | 4 | Another problem with the machine, such as permissions, a missing output directory or an output that already exists |

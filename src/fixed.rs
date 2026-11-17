@@ -108,6 +108,37 @@ pub fn parse_three_fixed(s: &str) -> crate::Res<[i64; 3]> {
     ])
 }
 
+/// The fixed-point value of a binary float, rounded to 10 fractional digits as decimals are. The
+/// float's exact value is scaled in integers, so a float64 keeps every bit it has down to 1e-10.
+pub fn fixed_from_float(x: f64) -> crate::Res<i64> {
+    let invalid = || format!("Invalid or out-of-range coordinate: {x}");
+    let bits = x.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = (bits & ((1 << 52) - 1)) as i128;
+    // |x| = mantissa · 2^power, with a 53-bit mantissa, so `mantissa · SCALE` fits in 87 bits.
+    let (mantissa, power) = match exponent {
+        0 => (fraction, -1074),
+        0x7ff => return Err(invalid().into()),
+        _ => (fraction | 1 << 52, exponent - 1075),
+    };
+    // From 2^52 up, |x| is far outside the ±9.2e8 m that fixed point spans.
+    if power >= 0 {
+        return Err(invalid().into());
+    }
+    let shift = power.unsigned_abs();
+    let magnitude = if shift >= 100 {
+        0
+    } else {
+        (mantissa * SCALE + (1 << (shift - 1))) >> shift
+    };
+    let value = if x.is_sign_negative() {
+        -magnitude
+    } else {
+        magnitude
+    };
+    i64::try_from(value).map_err(|_| invalid().into())
+}
+
 /// Format a fixed-point value back to decimal, trailing zeros trimmed.
 pub fn format_fixed(val: i128) -> String {
     if val == 0 {
@@ -299,6 +330,21 @@ mod tests {
             parse_decimal_fixed("-0.99999999995").unwrap(),
             -SCALE as i64
         );
+    }
+
+    #[test]
+    fn floats_convert_by_their_exact_value() {
+        // 0.1f32 is 0.100000001490116119384765625.
+        assert_eq!(fixed_from_float(0.1f32 as f64).unwrap(), 1_000_000_015);
+        assert_eq!(fixed_from_float(-2.5).unwrap(), -25_000_000_000);
+        // A georeferenced float64 keeps its last bits: 2^-30 m steps at this magnitude.
+        let x = 6_543_210.0 + 2f64.powi(-30);
+        assert_eq!(fixed_from_float(x).unwrap(), 65_432_100_000_000_009);
+        assert_eq!(fixed_from_float(f64::MIN_POSITIVE).unwrap(), 0);
+        assert_eq!(fixed_from_float(-0.).unwrap(), 0);
+        assert!(fixed_from_float(1e9).is_err());
+        assert!(fixed_from_float(f64::NAN).is_err());
+        assert!(fixed_from_float(f64::INFINITY).is_err());
     }
 
     #[test]

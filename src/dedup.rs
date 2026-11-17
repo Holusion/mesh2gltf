@@ -5,7 +5,10 @@
 use crate::obj::Corner;
 use crate::Res;
 use memmap2::MmapMut;
-use std::{fs::OpenOptions, path::Path};
+use std::{
+    fs::{File, OpenOptions},
+    path::Path,
+};
 /// generation u32, output index u32, chain head u32 (record + 1, 0 = none), vt u64, vn u64.
 const ENTRY: usize = 28;
 /// vt u64, vn u64, output index u32, next u32 (record + 1, 0 = none).
@@ -16,7 +19,7 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
-fn sparse(path: &Path, len: u64) -> Res<MmapMut> {
+fn sparse(path: &Path, len: u64) -> Res<(File, MmapMut)> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -25,24 +28,31 @@ fn sparse(path: &Path, len: u64) -> Res<MmapMut> {
     file.set_len(len)?;
     // SAFETY: the file was just created in the private workspace and is only accessed through
     // this mapping. It is sparse: a full disk surfaces as SIGBUS rather than an error.
-    Ok(unsafe { MmapMut::map_mut(&file)? })
+    let map = unsafe { MmapMut::map_mut(&file)? };
+    Ok((file, map))
 }
 pub struct Dedup {
     table: MmapMut,
     records: MmapMut,
+    /// Kept to grow `records` when `corners` was only an estimate.
+    records_file: File,
     used: usize,
     generation: u32,
 }
 impl Dedup {
-    /// `corners` bounds the corners of any one primitive, and so its overflow records.
+    /// `corners` sizes the overflow records: a bound on the corners of any one primitive, so
+    /// that they never grow, or an estimate, past which they double.
     pub fn create(dir: &Path, positions: u64, corners: u64) -> Res<Self> {
         let size = |n: u64, width: usize| {
             n.checked_mul(width as u64)
                 .ok_or("Deduplication table size overflow")
         };
+        let (_, table) = sparse(&dir.join("dedup-table"), size(positions, ENTRY)?)?;
+        let (records_file, records) = sparse(&dir.join("dedup-seams"), size(corners, RECORD)?)?;
         Ok(Self {
-            table: sparse(&dir.join("dedup-table"), size(positions, ENTRY)?)?,
-            records: sparse(&dir.join("dedup-seams"), size(corners, RECORD)?)?,
+            table,
+            records,
+            records_file,
             used: 0,
             generation: 0,
         })
@@ -82,10 +92,15 @@ impl Dedup {
             link = u32_at(r, 20);
         }
         let id = self.used;
-        let r = self
-            .records
-            .get_mut(id * RECORD..(id + 1) * RECORD)
-            .ok_or("Seam records exceed the primitive's corner count")?;
+        if (id + 1) * RECORD > self.records.len() {
+            let len = (self.records.len() * 2).max(RECORD * 1024);
+            // Windows can't resize a file while it is mapped.
+            self.records = MmapMut::map_anon(1)?;
+            self.records_file.set_len(len as u64)?;
+            // SAFETY: as in `sparse`.
+            self.records = unsafe { MmapMut::map_mut(&self.records_file)? };
+        }
+        let r = &mut self.records[id * RECORD..(id + 1) * RECORD];
         r[0..8].copy_from_slice(&corner.vt.to_le_bytes());
         r[8..16].copy_from_slice(&corner.vn.to_le_bytes());
         r[16..20].copy_from_slice(&next.to_le_bytes());
@@ -120,6 +135,22 @@ mod tests {
         assert_eq!(d.find_or_insert(c(2, 5, 0), 0).unwrap(), None);
         assert_eq!(d.find_or_insert(c(2, 1, 0), 1).unwrap(), None);
         assert_eq!(d.find_or_insert(c(2, 5, 0), 2).unwrap(), Some(0));
+        drop(d);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn seam_records_grow_past_an_estimate() {
+        let dir = std::env::temp_dir().join(format!("mesh2gltf-grow-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut d = Dedup::create(&dir, 1, 1).unwrap();
+        d.reset().unwrap();
+        let c = |vt| Corner { v: 1, vt, vn: 0 };
+        for vt in 0..2000 {
+            assert_eq!(d.find_or_insert(c(vt), vt as u32).unwrap(), None);
+        }
+        for vt in 0..2000 {
+            assert_eq!(d.find_or_insert(c(vt), 0).unwrap(), Some(vt as u32));
+        }
         drop(d);
         std::fs::remove_dir_all(dir).unwrap();
     }

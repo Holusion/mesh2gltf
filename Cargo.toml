@@ -2,7 +2,7 @@
 name = "mesh2gltf"
 version = "0.1.0"
 edition = "2021"
-description = "Disk-backed OBJ and VRML importer for georeferenced glTF assets"
+description = "Disk-backed OBJ, PLY and VRML importer for georeferenced glTF assets"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/Holusion/mesh2gltf"
