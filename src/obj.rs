@@ -1,0 +1,494 @@
+//! OBJ decoding to random-access attribute spools and a sequential face spool.
+//! Vertex components glTF cannot carry are dropped with one warning per kind, never an error.
+//! Spools are written sequentially, then memory-mapped for the random-access replay.
+use crate::{
+    diagnostics::{safe, shown, Tally},
+    failure::Context,
+    references::References,
+    Res,
+};
+use crate::{
+    fixed::{parse_three_fixed, BBox},
+    material::{self, Material, Origin},
+};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::{BufRead, BufReader, BufWriter, Read, Write},
+    path::Path,
+};
+pub const MAX_FACE: usize = 4096;
+/// One `vc` record: linear RGB 1 1 1 as three little-endian f64.
+const WHITE: [u8; 24] = {
+    let one = 1f64.to_le_bytes();
+    let mut record = [0; 24];
+    let mut i = 0;
+    while i < 24 {
+        record[i] = one[i % 8];
+        i += 1;
+    }
+    record
+};
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct Corner {
+    pub v: u64,
+    pub vt: u64,
+    pub vn: u64,
+}
+pub struct Scene {
+    pub bbox: BBox,
+    pub missing_normals: bool,
+    /// A `vc` spool holds one linear RGB record per position.
+    pub colors: bool,
+    pub objects: Vec<String>,
+    pub materials: Vec<Material>,
+    pub counts: [u64; 3],
+}
+fn index(raw: &str, count: u64) -> Res<u64> {
+    let n: i64 = raw.parse()?;
+    let n = if n < 0 {
+        count as i128 + n as i128 + 1
+    } else {
+        n as i128
+    };
+    if n <= 0 || n > u64::MAX as i128 {
+        return Err("OBJ index is zero or out of range".into());
+    }
+    Ok(n as u64)
+}
+fn corner(token: &str, counts: [u64; 3]) -> Res<Corner> {
+    let mut parts = token.split('/');
+    let v = index(parts.next().ok_or("Missing vertex index")?, counts[0])?;
+    let vt = match parts.next() {
+        Some(s) if !s.is_empty() => index(s, counts[1])?,
+        _ => 0,
+    };
+    let vn = match parts.next() {
+        Some(s) if !s.is_empty() => index(s, counts[2])?,
+        _ => 0,
+    };
+    if parts.next().is_some() {
+        return Err("Too many OBJ index components".into());
+    }
+    Ok(Corner { v, vt, vn })
+}
+fn floats(rest: &str, count: usize) -> Res<Vec<f64>> {
+    let mut out = Vec::new();
+    for s in rest.split_whitespace() {
+        let n: f64 = s.parse()?;
+        if !n.is_finite() {
+            return Err("Non-finite attribute".into());
+        }
+        out.push(n);
+    }
+    if out.len() < count {
+        return Err("Missing attribute components".into());
+    }
+    Ok(out)
+}
+fn warn_once(warned: &mut HashSet<&'static str>, key: &'static str, message: &str) {
+    if warned.insert(key) {
+        crate::say!("Warning: {message}");
+    }
+}
+/// OBJ vertex colours are display (sRGB) values; glTF `COLOR_0` is linear.
+fn srgb_to_linear(c: f64) -> f64 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+/// `keep_colors` false skips vertex colours entirely, as if the file had none.
+pub fn spool(
+    source: &Path,
+    dir: &Path,
+    progress: bool,
+    references: &References,
+    origin: Origin,
+    keep_colors: bool,
+) -> Res<Scene> {
+    // A generated OBJ names its own MTL in the workspace, whereas its textures are the input's.
+    let libraries = match origin {
+        Origin::Model => references.clone(),
+        Origin::GeneratedFrom(_) => References::confined(dir)?,
+    };
+    // A line of a generated OBJ means nothing to whoever supplied the input.
+    let location = |line: usize| match origin {
+        Origin::Model => format!("{}:{line}", shown(source)),
+        Origin::GeneratedFrom(input) => shown(input),
+    };
+    let mut attrs = [
+        BufWriter::new(File::create(dir.join("v"))?),
+        BufWriter::new(File::create(dir.join("vt"))?),
+        BufWriter::new(File::create(dir.join("vn"))?),
+    ];
+    let mut faces = BufWriter::new(File::create(dir.join("faces"))?);
+    // Created by the first coloured position, so files without colours pay nothing.
+    let mut colors: Option<BufWriter<File>> = None;
+    let mut scene = Scene {
+        bbox: BBox::new(),
+        missing_normals: false,
+        colors: false,
+        objects: vec!["default".into()],
+        materials: vec![Material::new("default")],
+        counts: [0; 3],
+    };
+    let mut definitions = HashMap::new();
+    let mut names = HashMap::from([("default".to_owned(), 0u32)]);
+    let mut object = 0u32;
+    let mut seen_object = false;
+    let mut flat = false;
+    let mut material = 0u32;
+    let mut warned = HashSet::new();
+    let mut unsupported = Tally::new("unsupported OBJ records omitted");
+    let mut undefined = Tally::new("undefined materials, using the default");
+    let mut library_warnings = material::Warnings::new();
+    let mut short_faces = 0u64;
+    let mut record = Vec::new();
+    let mut reader = BufReader::with_capacity(
+        256 * 1024,
+        File::open(source).with_context(|| shown(source))?,
+    );
+    let mut line = String::new();
+    // A statement continued over several lines, and the line it started on.
+    let mut joined = String::new();
+    let mut start_line = 0;
+    let mut line_no = 0;
+    let mut bytes = 0;
+    let mut next_progress = 100_000_000;
+    // Bound records even for corrupt/pathological inputs, rather than allocate arbitrarily.
+    loop {
+        line.clear();
+        let size = Read::by_ref(&mut reader)
+            .take(1024 * 1024 + 1)
+            .read_line(&mut line)?;
+        let eof = size == 0;
+        if eof && joined.is_empty() {
+            break;
+        }
+        if size > 1024 * 1024 {
+            return Err("OBJ line exceeds 1 MiB limit".into());
+        }
+        if !eof {
+            bytes += size;
+            line_no += 1;
+        }
+        if progress && bytes >= next_progress {
+            crate::say!("Spooling OBJ: {}", crate::format::fmt_bytes(bytes as u64));
+            next_progress = bytes + 100_000_000;
+        }
+        let stripped = line.split('#').next().unwrap().trim();
+        // A trailing backslash, optionally followed by whitespace, continues the statement on the
+        // next line, as in Blender's importer (`read_next_obj_line`), which applies it to every
+        // statement; obj2gltf only does so for faces. The OBJ spec shows it in examples without
+        // stating a rule. Comments are stripped first, so a comment never continues: a remark
+        // ending in a Windows path such as `C:\models\` must not swallow the next line.
+        if let Some(head) = stripped.strip_suffix('\\').filter(|_| !eof) {
+            if joined.is_empty() {
+                start_line = line_no;
+            }
+            if joined.len() + head.len() >= 1024 * 1024 {
+                return Err(format!(
+                    "{}: OBJ statement exceeds 1 MiB limit",
+                    location(start_line)
+                )
+                .into());
+            }
+            joined.push_str(head);
+            joined.push(' ');
+            continue;
+        }
+        let continued = !joined.is_empty();
+        if continued {
+            joined.push_str(stripped);
+        } else {
+            start_line = line_no;
+        }
+        let text = if continued { joined.trim() } else { stripped };
+        let (written, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        // Keywords match whatever their case, as in obj2gltf and three.js, as a safety net for
+        // exporters that capitalise them. No two OBJ keywords differ only by case. Only keys
+        // that need it are lowercased, so `v` lines allocate nothing.
+        let lowered;
+        let key = if written.bytes().any(|b| b.is_ascii_uppercase()) {
+            lowered = written.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            written
+        };
+        let rest = rest.trim();
+        let result: Res<()> = (|| {
+            match key {
+                "v" => {
+                    let coords = parse_three_fixed(rest)?;
+                    scene.bbox.add(coords);
+                    for n in coords {
+                        attrs[0].write_all(&n.to_le_bytes())?;
+                    }
+                    scene.counts[0] += 1;
+                    // `x y z r g b [a]` is the de-facto colour extension, `x y z w` a rational weight.
+                    let mut extra = rest.split_whitespace().skip(3);
+                    let mut rgb = None;
+                    match extra.clone().count() {
+                        0 => {}
+                        1 => {
+                            if extra.next().unwrap().parse() != Ok(1.) {
+                                warn_once(&mut warned, "v w", "vertex weights (w) are omitted");
+                            }
+                        }
+                        3 | 4 if !keep_colors => {}
+                        n @ (3 | 4) => {
+                            let mut c = [0.; 3];
+                            for c in &mut c {
+                                let raw: f64 = extra.next().unwrap().parse()?;
+                                if !raw.is_finite() {
+                                    return Err("Non-finite attribute".into());
+                                }
+                                if !(0. ..=1.).contains(&raw) {
+                                    let message = "vertex colors outside [0,1] are clamped";
+                                    warn_once(&mut warned, "v range", message);
+                                }
+                                *c = srgb_to_linear(raw.clamp(0., 1.));
+                            }
+                            rgb = Some(c);
+                            if n == 4 {
+                                warn_once(&mut warned, "v alpha", "vertex color alpha is omitted");
+                            }
+                        }
+                        _ => {
+                            let message = "unrecognized extra v components are omitted";
+                            warn_once(&mut warned, "v extra", message);
+                        }
+                    }
+                    // Positions without a colour are white, which leaves the material unchanged.
+                    let mut backfill = 0;
+                    if rgb.is_some() && colors.is_none() {
+                        colors = Some(BufWriter::new(File::create(dir.join("vc"))?));
+                        backfill = scene.counts[0] - 1;
+                    }
+                    if let Some(writer) = colors.as_mut() {
+                        for _ in 0..backfill {
+                            writer.write_all(&WHITE)?;
+                        }
+                        for n in rgb.unwrap_or([1.; 3]) {
+                            writer.write_all(&n.to_le_bytes())?;
+                        }
+                    }
+                }
+                "vt" => {
+                    let nums = floats(rest, 1)?;
+                    if nums.iter().skip(2).any(|n| *n != 0.) {
+                        let message = "texture coordinates beyond u v are omitted";
+                        warn_once(&mut warned, "vt w", message);
+                    }
+                    for n in [nums[0], *nums.get(1).unwrap_or(&0.)] {
+                        attrs[1].write_all(&n.to_le_bytes())?;
+                    }
+                    scene.counts[1] += 1;
+                }
+                "vn" => {
+                    let nums = floats(rest, 3)?;
+                    if nums.len() != 3 {
+                        return Err("Expected three normal components".into());
+                    }
+                    if nums.iter().all(|n| *n == 0.) {
+                        scene.missing_normals = true;
+                    }
+                    for n in nums {
+                        attrs[2].write_all(&n.to_le_bytes())?;
+                    }
+                    scene.counts[2] += 1;
+                }
+                "o" => {
+                    seen_object = true;
+                    object = u32::try_from(scene.objects.len())?;
+                    scene.objects.push(if rest.is_empty() {
+                        "unnamed".into()
+                    } else {
+                        rest.into()
+                    });
+                }
+                "usemtl" => {
+                    material = if let Some(id) = names.get(rest) {
+                        *id
+                    } else {
+                        let id = u32::try_from(scene.materials.len())?;
+                        scene.materials.push(Material::new(rest));
+                        names.insert(rest.into(), id);
+                        id
+                    };
+                }
+                "mtllib" => {
+                    let parent = source.parent().unwrap_or(Path::new("."));
+                    let mut load = |file: &Path| {
+                        material::load(
+                            file,
+                            references,
+                            origin,
+                            &mut definitions,
+                            &mut library_warnings,
+                        )
+                    };
+                    // One file name with spaces in it, or several names.
+                    let whole = libraries.resolve(parent, rest).ok();
+                    if let Some(file) = whole.filter(|file| file.is_file()) {
+                        load(&file)?;
+                    } else {
+                        for name in rest.split_whitespace() {
+                            let file = libraries.resolve(parent, name);
+                            load(&file.with_context(|| format!("mtllib {}", safe(name)))?)?;
+                        }
+                    }
+                }
+                "f" => {
+                    let mut corners = Vec::new();
+                    for token in rest.split_whitespace() {
+                        if corners.len() == MAX_FACE {
+                            return Err(format!("Face exceeds {MAX_FACE} corners").into());
+                        }
+                        corners.push(corner(token, scene.counts)?);
+                    }
+                    // Two corners make a line and one a point: omitted like `l` and `p` records,
+                    // once their indices are known to be valid.
+                    if corners.len() < 3 {
+                        short_faces += 1;
+                        return Ok(());
+                    }
+                    scene.missing_normals |= corners.iter().any(|c| c.vn == 0);
+                    record.clear();
+                    encode_face(
+                        &mut record,
+                        object as usize,
+                        material as usize,
+                        flat,
+                        &corners,
+                    );
+                    faces.write_all(&record)?;
+                }
+                // Many exporters write only groups. Until an `o` shows the file names its
+                // objects, each `g` starts one, named like the group: obj2gltf turns groups into
+                // meshes too, and a repeated name, as with `o`, is a new object. Groups inside
+                // objects are not represented. The spec's default group name stands in for none.
+                "g" if !seen_object => {
+                    object = u32::try_from(scene.objects.len())?;
+                    scene.objects.push(if rest.is_empty() {
+                        "default".into()
+                    } else {
+                        rest.into()
+                    });
+                }
+                // Smoothing groups only switch flat shading, as in three.js: `s off` or `s 0` makes
+                // the faces that follow flat where the file gives no normals, and any group
+                // number, or a bare `s`, smooths them together again.
+                "s" => flat = rest.eq_ignore_ascii_case("off") || rest.parse::<u64>() == Ok(0),
+                "" | "g" => {}
+                _ => unsupported.add(written),
+            }
+            Ok(())
+        })();
+        result.with_context(|| location(start_line))?;
+        joined.clear();
+        if eof {
+            break;
+        }
+    }
+    if short_faces > 0 {
+        crate::say!("Warning: omitted {short_faces} faces with fewer than three corners");
+    }
+    for writer in &mut attrs {
+        writer.flush()?;
+    }
+    faces.flush()?;
+    if let Some(mut writer) = colors {
+        writer.flush()?;
+        scene.colors = true;
+    }
+    for m in &mut scene.materials {
+        if let Some(def) = definitions.remove(&m.name) {
+            *m = def;
+        } else if m.name != "default" {
+            undefined.add(&m.name);
+        }
+    }
+    Ok(scene)
+}
+/// One face spool record.
+pub struct Face {
+    pub object: usize,
+    pub material: usize,
+    /// Under `s off`: shaded flat where the file gives no normals.
+    pub flat: bool,
+    pub corners: Vec<Corner>,
+}
+/// Set in the corner count, which never comes near it, for a flat face.
+const FLAT: u32 = 1 << 31;
+/// Append one face spool record: object, material and corner count (with the flat flag), then
+/// `(v, vt, vn)` per corner.
+pub fn encode_face(
+    out: &mut Vec<u8>,
+    object: usize,
+    material: usize,
+    flat: bool,
+    corners: &[Corner],
+) {
+    let count = corners.len() as u32 | if flat { FLAT } else { 0 };
+    for n in [object as u32, material as u32, count] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    for c in corners {
+        for n in [c.v, c.vt, c.vn] {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+}
+pub fn read_face(reader: &mut impl Read) -> Res<Option<Face>> {
+    let mut first = [0; 4];
+    if reader.read(&mut first[..1])? == 0 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut first[1..])?;
+    let object = u32::from_le_bytes(first) as usize;
+    reader.read_exact(&mut first)?;
+    let material = u32::from_le_bytes(first) as usize;
+    reader.read_exact(&mut first)?;
+    let count = u32::from_le_bytes(first);
+    let flat = count & FLAT != 0;
+    let n = (count & !FLAT) as usize;
+    if !(3..=MAX_FACE).contains(&n) {
+        return Err("Invalid face spool".into());
+    }
+    let mut corners = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut a = [0u64; 3];
+        for x in &mut a {
+            let mut b = [0; 8];
+            reader.read_exact(&mut b)?;
+            *x = u64::from_le_bytes(b);
+        }
+        corners.push(Corner {
+            v: a[0],
+            vt: a[1],
+            vn: a[2],
+        });
+    }
+    Ok(Some(Face {
+        object,
+        material,
+        flat,
+        corners,
+    }))
+}
+pub fn fetch<const N: usize>(spool: &[u8], index: u64, count: u64) -> Res<[[u8; 8]; N]> {
+    if index == 0 || index > count {
+        return Err(format!("Index {index} outside attribute count {count}").into());
+    }
+    let record = usize::try_from(index - 1)
+        .ok()
+        .and_then(|i| i.checked_mul(N * 8))
+        .and_then(|offset| spool.get(offset..)?.get(..N * 8))
+        .ok_or("Attribute spool is shorter than its record count")?;
+    Ok(std::array::from_fn(|i| {
+        record[i * 8..i * 8 + 8].try_into().unwrap()
+    }))
+}
