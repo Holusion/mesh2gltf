@@ -1,6 +1,6 @@
 # Goals
 
-`mesh2gltf` is a minimal Rust CLI that imports very large OBJ and VRML meshes, often georeferenced and larger than the machine's RAM plus swap, into simple glTF 2.0: JSON with an external `.bin`, with the textures kept, copied or converted. It has a single command, `mesh2gltf [OPTIONS] <file>`. Keeping the code small to maintain is a goal of its own; resource use is already minimal.
+`mesh2gltf` is a minimal Rust CLI that imports very large OBJ, PLY and VRML meshes, often georeferenced and larger than the machine's RAM plus swap, into simple glTF 2.0: JSON with an external `.bin`, with the textures kept, copied or converted. It has a single command, `mesh2gltf [OPTIONS] <file>`. Keeping the code small to maintain is a goal of its own; resource use is already minimal.
 
 The README contains the command reference. The GitHub wiki has two sections: Conversion (format support, georeferencing, images and material approximations) and How it works (streaming, heap/mmap/disk use). Its sources are maintained in the separate `git@github.com:Holusion/mesh2gltf.wiki.git` repository, not in this repository. Keep both in sync with user-visible changes at the appropriate level of detail.
 
@@ -17,12 +17,12 @@ The README contains the command reference. The GitHub wiki has two sections: Con
 All modules sit directly in `src/`:
 
 - `main.rs` declares the modules, holds `Res`, `Options` and `run`, and maps failures to exit codes. `cli.rs` parses arguments and prints help.
-- `vrml.rs` turns VRML into an intermediate OBJ and MTL in the workspace. `obj.rs` spools OBJ geometry to disk, and `material.rs` reads MTL.
+- `vrml.rs` turns VRML into an intermediate OBJ and MTL in the workspace. `obj.rs` spools OBJ geometry to disk, and `material.rs` reads MTL. `ply.rs` spools PLY, ASCII or binary, straight into the same spools.
 - `triangulate.rs`, `dedup.rs`, `smooth.rs` and `group.rs` triangulate faces, deduplicate corners, generate normals and group faces by material. `fixed.rs` holds the fixed-point coordinates.
 - `gltf.rs` writes the glTF and its `.bin`, and `images.rs` places, checks and converts textures.
 - `disk.rs` (workspaces, file mappings and published outputs), `references.rs` (confinement), `failure.rs` (exit-code classes), `diagnostics.rs` (safe stderr) and `format.rs` support the rest.
 
-Input is OBJ and VRML only. Rewriting an existing glTF, and measuring one, are out of scope.
+Input is OBJ, PLY and VRML only, and PLY only as a mesh: point clouds are out of scope. Rewriting an existing glTF, and measuring one, are out of scope.
 
 # Conventions
 

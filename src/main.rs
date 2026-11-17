@@ -13,6 +13,7 @@ mod group;
 mod images;
 mod material;
 mod obj;
+mod ply;
 mod references;
 mod smooth;
 mod triangulate;
@@ -71,7 +72,7 @@ fn run(mut opts: Options) -> Res<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "obj" | "wrl" | "vrml") {
+    if !matches!(ext.as_str(), "obj" | "ply" | "wrl" | "vrml") {
         return Err(format!("Unsupported input format: .{}", diagnostics::safe(&ext)).into());
     }
     // Not `exists`, which follows a link and says no if it leads nowhere.
@@ -90,26 +91,37 @@ fn run(mut opts: Options) -> Res<()> {
     workspace.explain(convert(&opts, &ext, references, &workspace.path))
 }
 fn convert(opts: &Options, ext: &str, references: References, workspace: &Path) -> Res<()> {
-    let source = if ext == "obj" {
-        opts.input.clone()
-    } else {
-        let intermediate = workspace.join("source.obj");
-        vrml::convert(&opts.input, &intermediate, workspace, opts.progress)?;
-        intermediate
+    let scene = match ext {
+        "ply" => ply::spool(
+            &opts.input,
+            workspace,
+            opts.progress,
+            &references,
+            !opts.no_color,
+        )?,
+        "obj" => obj::spool(
+            &opts.input,
+            workspace,
+            opts.progress,
+            &references,
+            Origin::Model,
+            !opts.no_color,
+        )?,
+        _ => {
+            let intermediate = workspace.join("source.obj");
+            vrml::convert(&opts.input, &intermediate, workspace, opts.progress)?;
+            let origin = Origin::GeneratedFrom(&opts.input);
+            let colors = !opts.no_color;
+            obj::spool(
+                &intermediate,
+                workspace,
+                opts.progress,
+                &references,
+                origin,
+                colors,
+            )?
+        }
     };
-    let origin = if ext == "obj" {
-        Origin::Model
-    } else {
-        Origin::GeneratedFrom(&opts.input)
-    };
-    let scene = obj::spool(
-        &source,
-        workspace,
-        opts.progress,
-        &references,
-        origin,
-        !opts.no_color,
-    )?;
     // Faces are checked before the slow work of converting textures and writing geometry.
     let groups = group::group(&scene, workspace, opts.progress)?;
     let images = images::prepare(

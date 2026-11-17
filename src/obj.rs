@@ -91,8 +91,8 @@ fn warn_once(warned: &mut HashSet<&'static str>, key: &'static str, message: &st
         crate::say!("Warning: {message}");
     }
 }
-/// OBJ vertex colours are display (sRGB) values; glTF `COLOR_0` is linear.
-fn srgb_to_linear(c: f64) -> f64 {
+/// OBJ and PLY vertex colours are display (sRGB) values; glTF `COLOR_0` is linear.
+pub fn srgb_to_linear(c: f64) -> f64 {
     if c <= 0.04045 {
         c / 12.92
     } else {

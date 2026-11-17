@@ -1430,7 +1430,7 @@ fn help_and_a_second_input() {
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         let help = String::from_utf8_lossy(&out.stdout);
         assert!(
-            help.starts_with("Usage: mesh2gltf [OPTIONS] <file.obj|file.wrl|file.vrml>"),
+            help.starts_with("Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>"),
             "{help}"
         );
     }
@@ -1441,4 +1441,303 @@ fn help_and_a_second_input() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("Unexpected argument"), "{stderr}");
+}
+
+/// A PLY value, written as text or packed in the file's byte order.
+#[derive(Clone, Copy)]
+enum P {
+    U8(u8),
+    I32(i32),
+    F32(f32),
+    F64(f64),
+}
+/// A PLY file in `format`: `header` holds its element and property lines, `values` its body.
+fn ply(format: &str, header: &str, values: &[P]) -> Vec<u8> {
+    let mut out = format!("ply\nformat {format} 1.0\n{header}end_header\n").into_bytes();
+    for value in values {
+        let big = format == "binary_big_endian";
+        match (format, *value) {
+            ("ascii", P::U8(x)) => out.extend(format!("{x} ").bytes()),
+            ("ascii", P::I32(x)) => out.extend(format!("{x} ").bytes()),
+            ("ascii", P::F32(x)) => out.extend(format!("{x} ").bytes()),
+            ("ascii", P::F64(x)) => out.extend(format!("{x} ").bytes()),
+            (_, P::U8(x)) => out.push(x),
+            (_, P::I32(x)) if big => out.extend(x.to_be_bytes()),
+            (_, P::I32(x)) => out.extend(x.to_le_bytes()),
+            (_, P::F32(x)) if big => out.extend(x.to_be_bytes()),
+            (_, P::F32(x)) => out.extend(x.to_le_bytes()),
+            (_, P::F64(x)) if big => out.extend(x.to_be_bytes()),
+            (_, P::F64(x)) => out.extend(x.to_le_bytes()),
+        }
+    }
+    out
+}
+fn ply_fixture(bytes: &[u8]) -> (Fixture, std::process::Output) {
+    let f = Fixture::new();
+    fs::write(f.0.join("in.ply"), bytes).unwrap();
+    let result = f.import("in.ply", false);
+    (f, result)
+}
+/// Primitives as (material name, vertex count, index count, attribute names).
+fn ply_primitives(root: &Value) -> Vec<(String, u64, u64, Vec<String>)> {
+    let accessor = |id: &Value| &root["accessors"][id.as_u64().unwrap() as usize];
+    root["meshes"][0]["primitives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            let material = &root["materials"][p["material"].as_u64().unwrap() as usize];
+            (
+                material["name"].as_str().unwrap().to_owned(),
+                accessor(&p["attributes"]["POSITION"])["count"]
+                    .as_u64()
+                    .unwrap(),
+                accessor(&p["indices"])["count"].as_u64().unwrap(),
+                p["attributes"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect()
+}
+#[test]
+fn ply_ascii_and_binary_of_either_byte_order_give_the_same_model() {
+    let header = "comment a quad\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\nproperty float nx\nproperty float ny\nproperty float nz\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nelement face 1\nproperty list uchar int vertex_indices\n";
+    let mut values = Vec::new();
+    for (x, y) in [(0., 0.), (1., 0.), (1., 1.), (0., 1.)] {
+        values.extend([P::F32(x), P::F32(y), P::F32(0.25)]);
+        values.extend([P::F32(0.), P::F32(0.), P::F32(1.)]);
+        values.extend([P::U8(255), P::U8((x * 255.) as u8), P::U8(0)]);
+    }
+    values.extend([4, 0, 1, 2, 3].map(P::I32));
+    values[36] = P::U8(4);
+    let mut outputs = Vec::new();
+    for format in ["ascii", "binary_little_endian", "binary_big_endian"] {
+        let (f, result) = ply_fixture(&ply(format, header, &values));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "{format}: {stderr}");
+        let (root, bin) = f.result();
+        assert_eq!(
+            ply_primitives(&root),
+            [(
+                "default-vertex-colors".into(),
+                4,
+                6,
+                vec!["COLOR_0".into(), "NORMAL".into(), "POSITION".into()]
+            )],
+            "{format}"
+        );
+        outputs.push(bin);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], outputs[2]);
+}
+#[test]
+fn faceless_ply_is_rejected_as_a_point_cloud() {
+    let vertices = "element vertex 1\nproperty float x\nproperty float y\nproperty float z\n";
+    let values = [P::F32(0.); 3];
+    for header in [
+        vertices.to_owned(),
+        format!("{vertices}element face 0\nproperty list uchar int vertex_indices\n"),
+    ] {
+        let (f, result) = ply_fixture(&ply("binary_little_endian", &header, &values));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(result.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("in.ply: PLY file has no faces; point clouds are not supported"),
+            "{stderr}"
+        );
+        assert!(!f.0.join("out.gltf").exists());
+    }
+}
+#[test]
+fn ply_per_corner_texcoords_share_vertices_and_pick_textures() {
+    let f = Fixture::new();
+    for name in ["a.png", "b.png"] {
+        image::RgbImage::new(1, 1).save(f.0.join(name)).unwrap();
+    }
+    let header = "comment TextureFile a.png\ncomment TextureFile b.png\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\nelement face 4\nproperty list uchar int vertex_indices\nproperty list uchar float texcoord\nproperty int texnumber\nproperty uchar red\n";
+    let mut values = Vec::new();
+    for (x, y) in [(0., 0.), (1., 0.), (1., 1.), (0., 1.)] {
+        values.extend([P::F32(x), P::F32(y), P::F32(0.)]);
+    }
+    let face = |corners: [i32; 3], uvs: &[f32], texnumber| {
+        let mut v = vec![P::U8(3)];
+        v.extend(corners.map(P::I32));
+        v.push(P::U8(uvs.len() as u8));
+        v.extend(uvs.iter().map(|t| P::F32(*t)));
+        v.extend([P::I32(texnumber), P::U8(9)]);
+        v
+    };
+    // The two faces on `a.png` agree on the UVs of the corners they share.
+    values.extend(face([0, 1, 2], &[0., 0., 1., 0., 1., 1.], 0));
+    values.extend(face([0, 2, 3], &[0., 0., 1., 1., 0., 1.], 0));
+    values.extend(face([1, 2, 3], &[0., 0., 1., 0., 1., 1.], 1));
+    // A texcoord list that doesn't match the corners leaves its face untextured.
+    values.extend(face([0, 1, 2], &[0., 0., 1., 0.], 0));
+    fs::write(
+        f.0.join("in.ply"),
+        ply("binary_little_endian", header, &values),
+    )
+    .unwrap();
+    let result = f.import("in.ply", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("unsupported PLY properties omitted: 1, for example face.red"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("1 faces whose texcoord list doesn't match"),
+        "{stderr}"
+    );
+    let (root, _) = f.result();
+    let uv = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        ply_primitives(&root),
+        [
+            (
+                "a.png".into(),
+                4,
+                6,
+                uv(&["NORMAL", "POSITION", "TEXCOORD_0"])
+            ),
+            (
+                "b.png".into(),
+                3,
+                3,
+                uv(&["NORMAL", "POSITION", "TEXCOORD_0"])
+            ),
+            ("a.png-untextured".into(), 3, 3, uv(&["NORMAL", "POSITION"])),
+        ]
+    );
+    // The texture is the whole colour.
+    let factors: Vec<_> = root["materials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["name"].as_str().unwrap(),
+                m["pbrMetallicRoughness"]["baseColorFactor"][0]
+                    .as_f64()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        factors,
+        [("a.png-untextured", 1.), ("a.png", 1.), ("b.png", 1.)]
+    );
+    assert_eq!(root["images"].as_array().unwrap().len(), 2);
+}
+#[test]
+fn ply_vertex_texcoords_and_unknown_elements() {
+    let header = "element vertex 3\nproperty float x\nproperty float y\nproperty float z\nproperty float s\nproperty float t\nproperty float scalar_Density\nelement face 1\nproperty list uchar int vertex_indices\nelement edge 2\nproperty list uchar int vertex_indices\nproperty uchar red\n";
+    let mut values = Vec::new();
+    for (x, y) in [(0., 0.), (1., 0.), (0., 1.)] {
+        values.extend([x, y, 0., x, y, 7.].map(P::F32));
+    }
+    values.extend([P::U8(3), P::I32(0), P::I32(1), P::I32(2)]);
+    for _ in 0..2 {
+        values.extend([P::U8(2), P::I32(0), P::I32(1), P::U8(5)]);
+    }
+    for format in ["ascii", "binary_little_endian"] {
+        let (f, result) = ply_fixture(&ply(format, header, &values));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("unsupported PLY elements omitted: 1, for example edge"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("vertex.scalar_Density"), "{stderr}");
+        let (root, bin) = f.result();
+        let p = &root["meshes"][0]["primitives"][0];
+        let uv = floats(
+            &root,
+            &bin,
+            p["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize,
+            2,
+        );
+        // glTF's V runs down, as for OBJ.
+        assert_eq!(uv, [vec![0., 1.], vec![1., 1.], vec![0., 0.]]);
+    }
+}
+#[test]
+fn ply_georeferenced_doubles_keep_their_place() {
+    let header = "element vertex 3\nproperty double x\nproperty double y\nproperty double z\nelement face 1\nproperty list uchar uint vertex_indices\n";
+    let mut values = Vec::new();
+    for (x, y) in [
+        (651234.5678, 6862001.234),
+        (651234.5718, 6862001.234),
+        (651234.5678, 6862001.238),
+    ] {
+        values.extend([P::F64(x), P::F64(y), P::F64(120.5)]);
+    }
+    values.extend([P::U8(3), P::I32(0), P::I32(1), P::I32(2)]);
+    for format in ["ascii", "binary_big_endian"] {
+        let (f, result) = ply_fixture(&ply(format, header, &values));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let (root, bin) = f.result();
+        assert_eq!(
+            root["extras"]["mesh2gltf"]["origin"],
+            serde_json::json!(["651234.57", "6862001.236", "120.5"])
+        );
+        let primitive = &root["meshes"][0]["primitives"][0];
+        let p = floats(
+            &root,
+            &bin,
+            primitive["attributes"]["POSITION"].as_u64().unwrap() as usize,
+            3,
+        );
+        let expected = [
+            [-0.0022, -0.002, 0.],
+            [0.0018, -0.002, 0.],
+            [-0.0022, 0.002, 0.],
+        ];
+        for (p, e) in p.iter().zip(expected) {
+            for i in 0..3 {
+                assert!((p[i] as f64 - e[i]).abs() < 1e-7, "{p:?} vs {e:?}");
+            }
+        }
+    }
+}
+#[test]
+fn ply_that_cannot_be_read_as_declared_is_rejected() {
+    let header = "element vertex 3\nproperty float x\nproperty float y\nproperty float z\nelement face 1\nproperty list uchar int vertex_indices\n";
+    let mut values = vec![P::F32(0.); 9];
+    values.extend([P::U8(3), P::I32(0), P::I32(1), P::I32(3)]);
+    let (_, result) = ply_fixture(&ply("ascii", header, &values));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("in.ply: face 0: PLY index or count out of range: 3"),
+        "{stderr}"
+    );
+    let mut bytes = ply("binary_little_endian", header, &values);
+    bytes.truncate(bytes.len() - 2);
+    let (_, result) = ply_fixture(&bytes);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("PLY data ends before the elements its header declares"),
+        "{stderr}"
+    );
+    // A texture outside the model's folder is refused like any other reference.
+    let header =
+        format!("comment TextureFile ../outside.png\n{header}property list uchar float texcoord\n");
+    let (_, result) = ply_fixture(&ply("ascii", &header, &values));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Texture ../outside.png: not found, or outside"),
+        "{stderr}"
+    );
 }
