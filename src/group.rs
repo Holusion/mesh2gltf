@@ -1,16 +1,55 @@
-//! Group the face spool by primitive key, (object, material, UV layout), on disk.
+//! Group the face spool by primitive key, (object, material, UV layout, vertex colours), on disk.
 //! Objects are already contiguous, since every `o` (or `g` before any `o`) starts a new one.
 //! Materials can interleave inside an object; only then is the spool rewritten, by a counting
 //! sort into a mapped file. File order is kept within each key.
-use crate::obj::{self, Scene};
-use crate::Res;
-use memmap2::MmapMut;
+use crate::obj::{self, Face, Scene};
+use crate::{disk::map, Res};
+use memmap2::{Mmap, MmapMut};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::BufReader,
     path::Path,
 };
+/// What the faces of a primitive share.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Key {
+    pub object: usize,
+    pub material: usize,
+    pub uv: bool,
+    /// The faces show vertex colours in place of the material's diffuse colour.
+    pub colored: bool,
+}
+/// The `vc` spool, when the model has vertex colours.
+pub fn colors(scene: &Scene, dir: &Path) -> Res<Option<Mmap>> {
+    scene.colors.then(|| map(&dir.join("vc"))).transpose()
+}
+/// The key of `face`, and whether its texture hides vertex colours it has.
+///
+/// Vertex colours replace the diffuse colour, and an RGB texture replaces them, in the order of
+/// VRML97's lighting model (ISO/IEC 14772-1, 4.14.3, table 4.6) and X3D's. OBJ defines no order.
+/// glTF would multiply `COLOR_0` into a texture, which darkens one by the colours that
+/// photogrammetry exporters bake from it. A face shows colours when any of its positions has one.
+pub fn key(scene: &Scene, colors: Option<&[u8]>, face: &Face) -> Res<(Key, bool)> {
+    let uv = face.corners[0].vt != 0;
+    let textured = uv && scene.materials[face.material].texture.is_some();
+    let mut has_colors = false;
+    if let Some(spool) = colors {
+        for c in &face.corners {
+            if obj::color(spool, c.v, scene.counts[0])?.is_some() {
+                has_colors = true;
+                break;
+            }
+        }
+    }
+    let key = Key {
+        object: face.object,
+        material: face.material,
+        uv,
+        colored: has_colors && !textured,
+    };
+    Ok((key, has_colors && textured))
+}
 pub struct Group {
     pub corners: u64,
     bytes: u64,
@@ -19,6 +58,7 @@ pub struct Group {
 /// rearranged so that each key's faces are contiguous and in that order.
 pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
     let path = dir.join("faces");
+    let colors = colors(scene, dir)?;
     let mut faces = BufReader::with_capacity(256 * 1024, File::open(&path)?);
     let mut groups: Vec<Group> = Vec::new();
     let mut keys = HashMap::new();
@@ -26,14 +66,10 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
     let mut interleaved = false;
     let mut count = 0u64;
     let mut untextured = 0u64;
-    while let Some(obj::Face {
-        object,
-        material,
-        corners,
-        ..
-    }) = obj::read_face(&mut faces)?
-    {
+    let mut hidden_colors = 0u64;
+    while let Some(face) = obj::read_face(&mut faces)? {
         count += 1;
+        let corners = &face.corners;
         let uv = corners[0].vt != 0;
         let normal = corners[0].vn != 0;
         if corners
@@ -42,8 +78,10 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
         {
             return Err(format!("Face {count} mixes missing and present UVs/normals").into());
         }
-        untextured += u64::from(scene.materials[material].texture.is_some() && !uv);
-        let id = *keys.entry((object, material, uv)).or_insert_with(|| {
+        untextured += u64::from(scene.materials[face.material].texture.is_some() && !uv);
+        let (key, hidden) = key(scene, colors.as_deref(), &face)?;
+        hidden_colors += u64::from(hidden);
+        let id = *keys.entry(key).or_insert_with(|| {
             groups.push(Group {
                 corners: 0,
                 bytes: 0,
@@ -59,6 +97,9 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
     }
     if untextured > 0 {
         crate::say!("Warning: {untextured} faces with a textured material have no UVs; they use an untextured copy of it");
+    }
+    if hidden_colors > 0 {
+        crate::say!("Warning: vertex colors on {hidden_colors} textured faces are dropped, since the texture replaces them");
     }
     if !interleaved {
         return Ok(groups);
@@ -84,16 +125,16 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
     }
     let mut faces = BufReader::with_capacity(256 * 1024, File::open(&path)?);
     let mut record = Vec::new();
-    while let Some(obj::Face {
-        object,
-        material,
-        flat,
-        corners,
-    }) = obj::read_face(&mut faces)?
-    {
-        let id = keys[&(object, material, corners[0].vt != 0)];
+    while let Some(face) = obj::read_face(&mut faces)? {
+        let id = keys[&key(scene, colors.as_deref(), &face)?.0];
         record.clear();
-        obj::encode_face(&mut record, object, material, flat, &corners);
+        obj::encode_face(
+            &mut record,
+            face.object,
+            face.material,
+            face.flat,
+            &face.corners,
+        );
         sorted[cursors[id]..cursors[id] + record.len()].copy_from_slice(&record);
         cursors[id] += record.len();
     }

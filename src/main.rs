@@ -58,7 +58,7 @@ pub struct Options {
     pub progress: bool,
     pub keep_tmp: bool,
     pub images: images::Options,
-    /// Drop OBJ vertex colours instead of writing `COLOR_0`/`_COLOR`.
+    /// Ignore vertex colours, so that untextured faces show their material's diffuse colour.
     pub no_color: bool,
     /// Follow file references anywhere, rather than only inside the input's directory.
     pub trusted: bool,

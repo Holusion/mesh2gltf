@@ -28,13 +28,15 @@ mesh2gltf [OPTIONS] <file.obj|file.wrl|file.vrml>
     --tmp-dir DIR  Workspace directory (default: the output's directory)
     --keep-tmp     Preserve the workspace for debugging
     --images MODE  auto (default), keep or copy
-    --no-color     Drop vertex colors
+    --no-color     Ignore vertex colors, keeping the material color on untextured faces
     --trusted      Let the model refer to files outside its folder
     --progress     Report reading and conversion progress on stderr
 -h, --help         Show help
 ```
 
 Without arguments, mesh2gltf prints this help.
+
+Vertex colors (OBJ `v x y z r g b`, VRML `Color` nodes) are only written on faces without a texture, where they replace the material's diffuse color (`Kd` or `diffuseColor`). A texture replaces them, so they are dropped on textured faces. `--no-color` drops them everywhere, which keeps the material's own color.
 
 JPG and PNG textures are used as they are. Other formats, such as BMP, TIFF, TGA or EXR, are converted to PNG, which is lossless and keeps alpha. Textures stay in place when input and output share a folder and no conversion is needed; otherwise they are copied. Source images are never modified.
 

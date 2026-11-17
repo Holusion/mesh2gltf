@@ -8,6 +8,9 @@
 //! written at the end of each `Shape`, when every array is known. Memory stays flat however big
 //! the mesh is.
 //!
+//! Coordinates are spooled too, and written as `v` lines when the shape ends, so that each can
+//! carry its `Color`, which may come before or after them.
+//!
 //! Coordinates go through the fixed-point parser, so a georeferenced `.wrl` converts to OBJ
 //! without losing a digit.
 
@@ -202,6 +205,7 @@ enum Array {
     CoordIndex,
     TexCoordIndex,
     NormalIndex,
+    ColorIndex,
     Urls,
     Skip,
 }
@@ -215,6 +219,7 @@ fn array_kind(parent: Node, field: &str) -> Array {
         (Node::IndexedFaceSet, "coordIndex") => Array::CoordIndex,
         (Node::IndexedFaceSet, "texCoordIndex") => Array::TexCoordIndex,
         (Node::IndexedFaceSet, "normalIndex") => Array::NormalIndex,
+        (Node::IndexedFaceSet, "colorIndex") => Array::ColorIndex,
         (Node::ImageTexture, "url") => Array::Urls,
         _ => Array::Skip,
     }
@@ -227,22 +232,44 @@ enum Frame {
 
 // ── index spools ─────────────────────────────────────────────────────────────
 
-/// One index array of one shape, written to disk as little-endian `i32`s (with VRML's `-1`
-/// face terminators kept inline) so it can be replayed in lockstep with its siblings.
+/// One array of one shape on disk, so it can be replayed in lockstep with its siblings. Index
+/// arrays are little-endian `i32`s, with VRML's `-1` face terminators kept inline; coordinates
+/// are fixed-point `i64` triples and colours `f64` triples.
 struct Spool {
     path: PathBuf,
     writer: BufWriter<File>,
 }
 
 impl Spool {
-    fn create(dir: &Path, name: &str) -> Res<Self> {
-        let path = dir.join(name);
-        let writer = BufWriter::new(File::create(&path)?);
-        Ok(Self { path, writer })
+    /// The spool in `slot`, created on first use so that an absent array stays absent.
+    fn open<'a>(slot: &'a mut Option<Spool>, dir: &Path, suffix: &str) -> Res<&'a mut Spool> {
+        if slot.is_none() {
+            let name = format!(
+                "mesh2gltf_import_{}_{}_{}.bin",
+                std::process::id(),
+                SPOOL_SEQ.fetch_add(1, Ordering::Relaxed),
+                suffix
+            );
+            let path = dir.join(name);
+            let writer = BufWriter::new(File::create(&path)?);
+            *slot = Some(Self { path, writer });
+        }
+        Ok(slot.as_mut().unwrap())
     }
 
     fn push(&mut self, i: i32) -> std::io::Result<()> {
         self.writer.write_all(&i.to_le_bytes())
+    }
+
+    fn push_three(&mut self, values: [[u8; 8]; 3]) -> std::io::Result<()> {
+        self.writer.write_all(values.as_flattened())
+    }
+
+    fn reader(&self) -> std::io::Result<BufReader<File>> {
+        Ok(BufReader::with_capacity(
+            256 * 1024,
+            File::open(&self.path)?,
+        ))
     }
 
     fn finish(&mut self) -> std::io::Result<()> {
@@ -329,7 +356,8 @@ fn sanitize(s: &str) -> String {
 
 #[derive(Default)]
 struct Warned {
-    colors: bool,
+    /// Shapes whose colours are omitted.
+    colors: u64,
     ragged: bool,
     short_face: bool,
 }
@@ -344,9 +372,15 @@ struct Shape {
     v_count: u64,
     vt_count: u64,
     vn_count: u64,
+    c_count: u64,
+    points: Option<Spool>,
+    colors: Option<Spool>,
     coord: Option<Spool>,
     texcoord: Option<Spool>,
     normal: Option<Spool>,
+    color_index: Option<Spool>,
+    /// `colorPerVertex FALSE`: one colour per face.
+    colors_per_face: bool,
     material: Material,
 }
 
@@ -435,6 +469,14 @@ pub fn convert(input: &Path, output: &Path, tmp_dir: &Path, progress: bool) -> R
                 }
                 if current == Node::IndexedFaceSet
                     && w == "FALSE"
+                    && words.last().map(String::as_str) == Some("colorPerVertex")
+                {
+                    if let Some(s) = shape.as_mut() {
+                        s.colors_per_face = true;
+                    }
+                }
+                if current == Node::IndexedFaceSet
+                    && w == "FALSE"
                     && words.last().map(String::as_str) == Some("solid")
                 {
                     if let Some(s) = shape.as_mut() {
@@ -502,9 +544,14 @@ pub fn convert(input: &Path, output: &Path, tmp_dir: &Path, progress: bool) -> R
                         v_count: 0,
                         vt_count: 0,
                         vn_count: 0,
+                        c_count: 0,
+                        points: None,
+                        colors: None,
                         coord: None,
                         texcoord: None,
                         normal: None,
+                        color_index: None,
+                        colors_per_face: false,
                         material: Material::default(),
                     });
                 }
@@ -563,6 +610,12 @@ pub fn convert(input: &Path, output: &Path, tmp_dir: &Path, progress: bool) -> R
 
     if shape_count == 0 {
         crate::say!("Warning: no Shape node found — the output contains no geometry.");
+    }
+    if warned.colors > 0 {
+        crate::say!(
+            "Warning: colors omitted on {} VRML shapes: only one color per coordinate is supported",
+            warned.colors
+        );
     }
 
     write_mtl(&mtl_path, &materials)
@@ -647,8 +700,9 @@ fn apply_scalar_field(field: &str, vals: &[String], shape: &mut Option<Shape>) -
 
 /// Consume one data array, up to its closing `]`.
 ///
-/// Coordinates are written straight to the OBJ as they stream past; index arrays are spooled to
-/// disk because their siblings may not have arrived yet. Either way nothing accumulates in memory.
+/// Texture coordinates and normals are written straight to the OBJ as they stream past;
+/// coordinates, colours and index arrays are spooled to disk because their siblings may not have
+/// arrived yet. Either way nothing accumulates in memory.
 #[allow(clippy::too_many_arguments)]
 fn read_array(
     kind: Array,
@@ -661,33 +715,26 @@ fn read_array(
     tmp_dir: &Path,
     warned: &mut Warned,
 ) -> Res<()> {
-    let mut group: Vec<i64> = Vec::with_capacity(3);
+    // The tuple being read: fixed-point `i64`s, or `f64`s for colours, as little-endian bytes.
+    let mut group: Vec<[u8; 8]> = Vec::with_capacity(3);
     let arity = match kind {
         Array::Points | Array::Normals | Array::Colors => 3,
         Array::TexPoints => 2,
         _ => 0,
     };
 
-    // Index arrays need a spool; create it lazily so an absent array stays absent.
-    if matches!(
-        kind,
-        Array::CoordIndex | Array::TexCoordIndex | Array::NormalIndex
-    ) {
-        if let Some(s) = shape.as_mut() {
-            let (slot, suffix) = match kind {
-                Array::CoordIndex => (&mut s.coord, "coord"),
-                Array::TexCoordIndex => (&mut s.texcoord, "texcoord"),
-                _ => (&mut s.normal, "normal"),
-            };
-            if slot.is_none() {
-                let name = format!(
-                    "mesh2gltf_import_{}_{}_{}.bin",
-                    std::process::id(),
-                    SPOOL_SEQ.fetch_add(1, Ordering::Relaxed),
-                    suffix
-                );
-                *slot = Some(Spool::create(tmp_dir, &name)?);
-            }
+    if let Some(s) = shape.as_mut() {
+        let slot = match kind {
+            Array::Points => Some((&mut s.points, "points")),
+            Array::Colors => Some((&mut s.colors, "colors")),
+            Array::CoordIndex => Some((&mut s.coord, "coord")),
+            Array::TexCoordIndex => Some((&mut s.texcoord, "texcoord")),
+            Array::NormalIndex => Some((&mut s.normal, "normal")),
+            Array::ColorIndex => Some((&mut s.color_index, "colorindex")),
+            _ => None,
+        };
+        if let Some((slot, suffix)) = slot {
+            Spool::open(slot, tmp_dir, suffix)?;
         }
     }
 
@@ -695,47 +742,57 @@ fn read_array(
         match tok {
             Tok::RBracket => break,
             Tok::Num => match kind {
-                Array::Points | Array::TexPoints | Array::Normals => {
-                    group.push(parse_decimal_fixed(&lex.text())?);
+                Array::Points | Array::Colors => {
+                    group.push(if kind == Array::Points {
+                        parse_decimal_fixed(&lex.text())?.to_le_bytes()
+                    } else {
+                        let c: f64 = lex.text().parse()?;
+                        if !c.is_finite() {
+                            return Err("Non-finite VRML color".into());
+                        }
+                        c.to_le_bytes()
+                    });
+                    if group.len() == arity {
+                        let triple = [group[0], group[1], group[2]];
+                        group.clear();
+                        let Some(s) = shape.as_mut() else { continue };
+                        if kind == Array::Points {
+                            s.points.as_mut().unwrap().push_three(triple)?;
+                            s.v_count += 1;
+                            *v_total += 1;
+                        } else {
+                            s.colors.as_mut().unwrap().push_three(triple)?;
+                            s.c_count += 1;
+                        }
+                    }
+                }
+                Array::TexPoints | Array::Normals => {
+                    group.push(parse_decimal_fixed(&lex.text())?.to_le_bytes());
                     if group.len() == arity {
                         let Some(s) = shape.as_mut() else {
                             group.clear();
                             continue;
                         };
-                        let prefix = match kind {
-                            Array::Points => "v",
-                            Array::TexPoints => "vt",
-                            _ => "vn",
-                        };
+                        let prefix = if kind == Array::TexPoints { "vt" } else { "vn" };
                         write!(out, "{}", prefix)?;
                         for g in &group {
-                            write!(out, " {}", format_fixed_as_decimal(*g))?;
+                            write!(out, " {}", format_fixed_as_decimal(i64::from_le_bytes(*g)))?;
                         }
                         writeln!(out)?;
-                        match kind {
-                            Array::Points => {
-                                s.v_count += 1;
-                                *v_total += 1;
-                            }
-                            Array::TexPoints => {
-                                s.vt_count += 1;
-                                *vt_total += 1;
-                            }
-                            _ => {
-                                s.vn_count += 1;
-                                *vn_total += 1;
-                            }
+                        if kind == Array::TexPoints {
+                            s.vt_count += 1;
+                            *vt_total += 1;
+                        } else {
+                            s.vn_count += 1;
+                            *vn_total += 1;
                         }
                         group.clear();
                     }
                 }
-                Array::Colors => {
-                    if !warned.colors {
-                        warned.colors = true;
-                        crate::say!("Warning: VRML per-vertex colours are omitted.");
-                    }
-                }
-                Array::CoordIndex | Array::TexCoordIndex | Array::NormalIndex => {
+                Array::CoordIndex
+                | Array::TexCoordIndex
+                | Array::NormalIndex
+                | Array::ColorIndex => {
                     let idx: i64 = lex.text().parse()?;
                     let idx = i32::try_from(idx)
                         .map_err(|_| format!("index out of range for OBJ: {}", idx))?;
@@ -743,7 +800,8 @@ fn read_array(
                         let slot = match kind {
                             Array::CoordIndex => &mut s.coord,
                             Array::TexCoordIndex => &mut s.texcoord,
-                            _ => &mut s.normal,
+                            Array::NormalIndex => &mut s.normal,
+                            _ => &mut s.color_index,
                         };
                         if let Some(sp) = slot.as_mut() {
                             sp.push(idx)?;
@@ -780,37 +838,99 @@ fn read_array(
     Ok(())
 }
 
-/// Replay the spooled index arrays in lockstep and write the `f` lines.
+/// Whether two index spools list the same faces.
+fn same_faces(a: &Spool, b: &Spool) -> Res<bool> {
+    let (mut a, mut b) = (a.reader()?, b.reader()?);
+    let (mut fa, mut fb) = (Vec::new(), Vec::new());
+    loop {
+        let more = read_face(&mut a, &mut fa)?;
+        if more != read_face(&mut b, &mut fb)? || fa != fb {
+            return Ok(false);
+        }
+        if !more {
+            return Ok(true);
+        }
+    }
+}
+
+/// Whether the shape's colours can go on its `v` lines, the only place OBJ has for them: one
+/// per coordinate, which VRML calls `colorPerVertex` without a `colorIndex` of its own.
+fn colors_per_coordinate(s: &Shape) -> Res<bool> {
+    if s.colors_per_face || s.c_count < s.v_count {
+        return Ok(false);
+    }
+    match (&s.color_index, &s.coord) {
+        (Some(index), _) if fs::metadata(&index.path)?.len() == 0 => Ok(true),
+        (Some(index), Some(coord)) => same_faces(index, coord),
+        _ => Ok(true),
+    }
+}
+
+/// Write the `v` lines, then replay the spooled index arrays in lockstep and write the `f` lines.
 fn finish_shape(
     mut s: Shape,
     out: &mut impl Write,
     materials: &mut Vec<Material>,
     warned: &mut Warned,
 ) -> Res<()> {
+    for sp in [
+        &mut s.points,
+        &mut s.colors,
+        &mut s.coord,
+        &mut s.texcoord,
+        &mut s.normal,
+        &mut s.color_index,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        sp.finish()?;
+    }
+
+    let colored = s.c_count > 0 && colors_per_coordinate(&s)?;
+    if s.c_count > 0 && !colored {
+        warned.colors += 1;
+    }
+    if let Some(points) = s.points.as_ref() {
+        let mut pr = points.reader()?;
+        let mut colors = match s.colors.as_ref().filter(|_| colored) {
+            Some(sp) => Some(sp.reader()?),
+            None => None,
+        };
+        let mut record = [0u8; 24];
+        for _ in 0..s.v_count {
+            pr.read_exact(&mut record)?;
+            write!(out, "v")?;
+            for n in record.as_chunks::<8>().0 {
+                write!(out, " {}", format_fixed_as_decimal(i64::from_le_bytes(*n)))?;
+            }
+            if let Some(cr) = colors.as_mut() {
+                cr.read_exact(&mut record)?;
+                for n in record.as_chunks::<8>().0 {
+                    write!(out, " {}", f64::from_le_bytes(*n))?;
+                }
+            }
+            writeln!(out)?;
+        }
+    }
+
     if !s.material.is_empty() {
         s.material.name = format!("{}_mtl_{}", s.name, materials.len());
         writeln!(out, "usemtl {}", s.material.name)?;
         materials.push(std::mem::take(&mut s.material));
     }
 
-    for sp in [&mut s.coord, &mut s.texcoord, &mut s.normal]
-        .into_iter()
-        .flatten()
-    {
-        sp.finish()?;
-    }
-
     let Some(coord) = s.coord.as_ref() else {
-        return Ok(());
+        return remove_spools(&s);
     };
 
-    let mut cr = BufReader::with_capacity(256 * 1024, File::open(&coord.path)?);
+    let mut cr = coord.reader()?;
     let mut tr = match s.texcoord.as_ref() {
-        Some(sp) => Some(BufReader::with_capacity(256 * 1024, File::open(&sp.path)?)),
+        Some(sp) => Some(sp.reader()?),
         None => None,
     };
     let mut nr = match s.normal.as_ref() {
-        Some(sp) => Some(BufReader::with_capacity(256 * 1024, File::open(&sp.path)?)),
+        Some(sp) => Some(sp.reader()?),
         None => None,
     };
 
@@ -879,11 +999,24 @@ fn finish_shape(
         writeln!(out)?;
     }
 
-    // Freed shape by shape, so they never pile up; the workspace removes them on error.
-    for sp in [&s.coord, &s.texcoord, &s.normal].into_iter().flatten() {
+    remove_spools(&s)
+}
+
+/// Spools are freed shape by shape, so they never pile up; the workspace removes them on error.
+fn remove_spools(s: &Shape) -> Res<()> {
+    for sp in [
+        &s.points,
+        &s.colors,
+        &s.coord,
+        &s.texcoord,
+        &s.normal,
+        &s.color_index,
+    ]
+    .into_iter()
+    .flatten()
+    {
         fs::remove_file(&sp.path)?;
     }
-
     Ok(())
 }
 

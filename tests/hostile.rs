@@ -1368,7 +1368,7 @@ fn thousands_of_bad_vrml_shapes_warn_once_each() {
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     for warning in [
         "partial tuple",
-        "colours are omitted",
+        "colors omitted on 20000 VRML shapes",
         "fewer than 3 vertices",
     ] {
         assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");

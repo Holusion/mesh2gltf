@@ -18,13 +18,13 @@ use std::{
     path::Path,
 };
 pub const MAX_FACE: usize = 4096;
-/// One `vc` record: linear RGB 1 1 1 as three little-endian f64.
-const WHITE: [u8; 24] = {
-    let one = 1f64.to_le_bytes();
+/// The `vc` record of a position without a colour: three NaNs, which no colour can be.
+const NO_COLOR: [u8; 24] = {
+    let nan = f64::NAN.to_le_bytes();
     let mut record = [0; 24];
     let mut i = 0;
     while i < 24 {
-        record[i] = one[i % 8];
+        record[i] = nan[i % 8];
         i += 1;
     }
     record
@@ -38,7 +38,7 @@ pub struct Corner {
 pub struct Scene {
     pub bbox: BBox,
     pub missing_normals: bool,
-    /// A `vc` spool holds one linear RGB record per position.
+    /// A `vc` spool holds one linear RGB record per position, NaN for a position without one.
     pub colors: bool,
     pub objects: Vec<String>,
     pub materials: Vec<Material>,
@@ -261,7 +261,7 @@ pub fn spool(
                             warn_once(&mut warned, "v extra", message);
                         }
                     }
-                    // Positions without a colour are white, which leaves the material unchanged.
+                    // Positions without a colour are marked as such: their faces keep the material.
                     let mut backfill = 0;
                     if rgb.is_some() && colors.is_none() {
                         colors = Some(BufWriter::new(File::create(dir.join("vc"))?));
@@ -269,10 +269,15 @@ pub fn spool(
                     }
                     if let Some(writer) = colors.as_mut() {
                         for _ in 0..backfill {
-                            writer.write_all(&WHITE)?;
+                            writer.write_all(&NO_COLOR)?;
                         }
-                        for n in rgb.unwrap_or([1.; 3]) {
-                            writer.write_all(&n.to_le_bytes())?;
+                        match rgb {
+                            Some(rgb) => {
+                                for n in rgb {
+                                    writer.write_all(&n.to_le_bytes())?;
+                                }
+                            }
+                            None => writer.write_all(&NO_COLOR)?,
                         }
                     }
                 }
@@ -491,4 +496,9 @@ pub fn fetch<const N: usize>(spool: &[u8], index: u64, count: u64) -> Res<[[u8; 
     Ok(std::array::from_fn(|i| {
         record[i * 8..i * 8 + 8].try_into().unwrap()
     }))
+}
+/// The linear colour of position `v` in the `vc` spool, or `None` for a position without one.
+pub fn color(spool: &[u8], v: u64, count: u64) -> Res<Option<[f64; 3]>> {
+    let rgb = fetch::<3>(spool, v, count)?.map(f64::from_le_bytes);
+    Ok((!rgb[0].is_nan()).then_some(rgb))
 }

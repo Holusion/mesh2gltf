@@ -1136,57 +1136,102 @@ fn zero_source_normals_are_smoothed_and_degenerate_triangles_skipped() {
     assert!((normals[0][2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
 }
 
+/// A primitive's material name, vertex stride and colours, if it has any.
+type Summary = (String, u64, Option<Vec<Vec<f32>>>);
+fn colored_primitives(root: &Value, bin: &[u8]) -> Vec<Summary> {
+    let mut found = Vec::new();
+    for mesh in root["meshes"].as_array().unwrap() {
+        for p in mesh["primitives"].as_array().unwrap() {
+            let attributes = p["attributes"].as_object().unwrap();
+            assert!(
+                attributes
+                    .keys()
+                    .all(|k| k == "COLOR_0" || !k.contains("COLOR")),
+                "{attributes:?}"
+            );
+            let position = attributes["POSITION"].as_u64().unwrap() as usize;
+            let view = root["accessors"][position]["bufferView"].as_u64().unwrap() as usize;
+            let colors = attributes
+                .get("COLOR_0")
+                .map(|c| floats(root, bin, c.as_u64().unwrap() as usize, 3));
+            found.push((
+                root["materials"][p["material"].as_u64().unwrap() as usize]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                root["bufferViews"][view]["byteStride"].as_u64().unwrap(),
+                colors,
+            ));
+        }
+    }
+    found
+}
+
 #[test]
-fn vertex_colors_become_linear_color_0_or_color_under_textures() {
+fn vertex_colors_replace_the_diffuse_color_and_give_way_to_textures() {
     let f = Fixture::new();
     image::RgbImage::new(1, 1)
         .save(f.0.join("albedo.png"))
         .unwrap();
     f.file(
         "in.mtl",
-        "newmtl plain\nKd 1 1 1\nnewmtl photo\nmap_Kd albedo.png\n",
+        "newmtl plain\nKd 0.5 0.5 0.5\nnewmtl photo\nKd 0.5 0.5 0.5\nmap_Kd albedo.png\n",
     );
-    // The first position has no colour: it is back-filled as white once colours appear.
-    f.file("in.obj", "mtllib in.mtl\nv 0 0 0\nv 1 0 0 1 0.5 0\nv 0 1 0 0.2 0.04045 1 0.5\nvt 0 0\nvt 1 0\nvt 0 1\nusemtl plain\nf 1 2 3\nf 1/1 2/2 3/3\nusemtl photo\nf 1/1 2/2 3/3\n");
+    // The first position has no colour, nor do the last three.
+    f.file("in.obj", "mtllib in.mtl\nv 0 0 0\nv 1 0 0 1 0.5 0\nv 0 1 0 0.2 0.04045 1 0.5\nv 0 0 1\nv 1 0 1\nv 0 1 1\nvt 0 0\nvt 1 0\nvt 0 1\nusemtl plain\nf 1 2 3\nf 4 5 6\nf 1/1 2/2 3/3\nusemtl photo\nf 1/1 2/2 3/3\nf 1 2 3\n");
     let result = f.import("in.obj", false);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "{stderr}");
     assert!(stderr.contains("vertex color alpha is omitted"), "{stderr}");
     assert!(
-        stderr.contains("vertex colors on 1 textured faces are kept as _COLOR"),
+        stderr.contains("vertex colors on 1 textured faces are dropped"),
         "{stderr}"
     );
     let (root, bin) = f.result();
-    let primitives = root["meshes"][0]["primitives"].as_array().unwrap();
-    assert_eq!(primitives.len(), 3);
-    // Position+normal+colour, then the same with UVs in between. The textured primitive keeps
-    // the same values under the application-specific name.
-    let layouts = [(36, "COLOR_0"), (44, "COLOR_0"), (44, "_COLOR")];
-    for (primitive, (stride, semantic)) in primitives.iter().zip(layouts) {
-        let other = if semantic == "_COLOR" {
-            "COLOR_0"
-        } else {
-            "_COLOR"
-        };
-        assert!(primitive["attributes"][other].is_null());
-        let accessor = primitive["attributes"][semantic].as_u64().unwrap() as usize;
-        assert_eq!(root["accessors"][accessor]["type"], "VEC3");
-        let view = root["accessors"][accessor]["bufferView"].as_u64().unwrap() as usize;
-        assert_eq!(root["bufferViews"][view]["byteStride"], stride);
-        let colors = floats(&root, &bin, accessor, 3);
+    let primitives = colored_primitives(&root, &bin);
+    let summary: Vec<_> = primitives
+        .iter()
+        .map(|(name, stride, colors)| (name.as_str(), *stride, colors.is_some()))
+        .collect();
+    // Colours on a face replace `Kd`, so its material is a white copy; a face whose positions
+    // have none keeps the material, and a texture drops them.
+    assert_eq!(
+        summary,
+        [
+            ("plain-vertex-colors", 36, true),
+            ("plain", 24, false),
+            ("plain-vertex-colors", 44, true),
+            ("photo", 32, false),
+            ("photo-vertex-colors", 36, true),
+        ]
+    );
+    for (_, _, colors) in &primitives {
+        let Some(colors) = colors else { continue };
+        // A position without a colour, on a face where others have one, is white.
         assert_eq!(colors[0], vec![1., 1., 1.]);
         assert_eq!(colors[1][0], 1.);
         assert!((colors[1][1] - 0.21404114).abs() < 1e-6);
         assert_eq!(colors[1][2], 0.);
         assert!((colors[2][0] - 0.03310477).abs() < 1e-6);
         assert!((colors[2][1] - 0.04045 / 12.92).abs() < 1e-7);
-        let position = primitive["attributes"]["POSITION"].as_u64().unwrap() as usize;
-        assert_eq!(floats(&root, &bin, position, 3)[2], vec![0., 1., 0.]);
     }
-    let uv = primitives[1]["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize;
-    assert_eq!(floats(&root, &bin, uv, 2)[1], vec![1., 1.]);
-    assert!(primitives[2]["attributes"]["TEXCOORD_0"].is_u64());
-    // --no-color drops them everywhere, and their warnings with them.
+    let materials: Vec<_> = root["materials"].as_array().unwrap().iter().collect();
+    assert_eq!(materials.len(), 4);
+    for m in materials {
+        let pbr = &m["pbrMetallicRoughness"];
+        let colored = m["name"].as_str().unwrap().ends_with("-vertex-colors");
+        let rgb = if colored { 1. } else { 0.5 };
+        assert_eq!(
+            pbr["baseColorFactor"],
+            serde_json::json!([rgb, rgb, rgb, 1.])
+        );
+        assert_eq!(pbr.get("baseColorTexture").is_some(), m["name"] == "photo");
+        assert_eq!(
+            m["extras"]["sourcePhong"]["Kd"],
+            serde_json::json!([0.5, 0.5, 0.5])
+        );
+    }
+    // --no-color drops them everywhere, and their warnings with them: materials keep `Kd`.
     let result = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
         .arg(f.0.join("in.obj"))
         .arg("--no-color")
@@ -1198,11 +1243,90 @@ fn vertex_colors_become_linear_color_0_or_color_under_textures() {
     assert!(result.status.success(), "{stderr}");
     assert!(!stderr.contains("color"), "{stderr}");
     let root: Value = serde_json::from_slice(&fs::read(f.0.join("plain.gltf")).unwrap()).unwrap();
-    for primitive in root["meshes"][0]["primitives"].as_array().unwrap() {
-        let attributes = primitive["attributes"].as_object().unwrap();
-        assert!(
-            attributes.keys().all(|k| !k.contains("COLOR")),
-            "{attributes:?}"
+    let bin = fs::read(f.0.join("plain.bin")).unwrap();
+    let names: Vec<_> = colored_primitives(&root, &bin)
+        .into_iter()
+        .map(|(name, _, colors)| {
+            assert!(colors.is_none());
+            name
+        })
+        .collect();
+    assert_eq!(names, ["plain", "plain", "photo", "photo-untextured"]);
+}
+
+#[test]
+fn vrml_colors_follow_the_same_rule() {
+    let f = Fixture::new();
+    image::RgbImage::new(1, 1)
+        .save(f.0.join("albedo.png"))
+        .unwrap();
+    let triangle = "coord Coordinate { point [0 0 0, 1 0 0, 0 1 0] } coordIndex [0 1 2 -1]";
+    let blue = "appearance Appearance { material Material { diffuseColor 0 0 1 } }";
+    let shapes = [
+        // Colours before the coordinates they belong to.
+        format!("DEF before Shape {{ {blue} geometry IndexedFaceSet {{ color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} {triangle} }} }}"),
+        format!("DEF indexed Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} colorIndex [0 1 2 -1] color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
+        format!("DEF plain Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} }} }}"),
+        format!("DEF perface Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} colorPerVertex FALSE color Color {{ color [1 0 0] }} }} }}"),
+        format!("DEF reindexed Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} colorIndex [2 1 0 -1] color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
+        format!("DEF textured Shape {{ appearance Appearance {{ texture ImageTexture {{ url \"albedo.png\" }} }} geometry IndexedFaceSet {{ {triangle} texCoord TextureCoordinate {{ point [0 0, 1 0, 0 1] }} color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
+    ];
+    f.file(
+        "in.wrl",
+        &format!("#VRML V2.0 utf8\n{}\n", shapes.join("\n")),
+    );
+    let result = f.import("in.wrl", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("colors omitted on 2 VRML shapes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("vertex colors on 1 textured faces are dropped"),
+        "{stderr}"
+    );
+    let (root, bin) = f.result();
+    let primitives = colored_primitives(&root, &bin);
+    let colored: Vec<_> = primitives
+        .iter()
+        .map(|(name, _, colors)| (name.split("_mtl_").next().unwrap(), colors.is_some()))
+        .collect();
+    assert_eq!(
+        colored,
+        [
+            ("before", true),
+            ("indexed", true),
+            ("plain", false),
+            ("perface", false),
+            ("reindexed", false),
+            ("textured", false),
+        ]
+    );
+    let colors = primitives[0].2.as_ref().unwrap();
+    assert_eq!(
+        colors,
+        &[vec![1., 0., 0.], vec![0., 1., 0.], vec![0., 0., 1.]]
+    );
+    for (name, _, colors) in &primitives {
+        let m = root["materials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name.as_str())
+            .unwrap();
+        let expected = if colors.is_some() {
+            assert!(name.ends_with("-vertex-colors"), "{name}");
+            [1., 1., 1., 1.]
+        } else if name.starts_with("textured") {
+            [0.8, 0.8, 0.8, 1.]
+        } else {
+            [0., 0., 1., 1.]
+        };
+        assert_eq!(
+            m["pbrMetallicRoughness"]["baseColorFactor"],
+            serde_json::json!(expected),
+            "{name}"
         );
     }
 }
@@ -1229,11 +1353,14 @@ fn unportable_vertex_components_warn_instead_of_failing() {
     assert_eq!(floats(&root, &bin, position, 3)[1], vec![2., 0., 0.]);
     let uv = primitive["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize;
     assert_eq!(floats(&root, &bin, uv, 2)[1], vec![1., 1.]);
-    let color = primitive["attributes"]["COLOR_0"].as_u64().unwrap() as usize;
+    // Only the second face has a coloured position, so only it has colours.
+    assert!(primitive["attributes"].get("COLOR_0").is_none());
+    let colored = &root["meshes"][0]["primitives"][1];
+    let color = colored["attributes"]["COLOR_0"].as_u64().unwrap() as usize;
     let colors = floats(&root, &bin, color, 3);
-    assert_eq!(colors[2], vec![1., 1., 1.]);
-    assert_eq!(colors[3][0], 0.);
-    assert_eq!(colors[3][2], 1.);
+    assert_eq!(colors[1], vec![1., 1., 1.]);
+    assert_eq!(colors[2][0], 0.);
+    assert_eq!(colors[2][2], 1.);
 }
 #[test]
 fn exit_codes_separate_a_bad_file_from_a_bad_environment() {

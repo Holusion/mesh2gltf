@@ -7,7 +7,7 @@ use crate::{
     disk::{map, parent, Outputs},
     failure::Context,
     fixed::{format_fixed_as_decimal, format_triple, SCALE},
-    group::Group,
+    group::{self, Group, Key},
     images::Plan,
     obj::{self, Scene},
     triangulate, Res,
@@ -37,11 +37,7 @@ fn layout(uv: bool, color: bool) -> (usize, usize, u64) {
 /// The open primitive. Its vertices stream into the payload as they are first referenced, its
 /// triangles into the index spool as u32, narrowed to u16 on close when the vertex count allows.
 struct Primitive {
-    object: usize,
-    material: usize,
-    uv: bool,
-    /// The colour attribute's semantic, when the primitive has one.
-    color: Option<&'static str>,
+    key: Key,
     start: u64,
     vertices: u64,
     triangles: u64,
@@ -76,18 +72,10 @@ impl Document {
         self.accessors.push(a);
         id
     }
-    fn open(
-        &mut self,
-        dedup: &mut Dedup,
-        (object, material, uv): (usize, usize, bool),
-        color: Option<&'static str>,
-    ) -> Res<Primitive> {
+    fn open(&mut self, dedup: &mut Dedup, key: Key) -> Res<Primitive> {
         dedup.reset()?;
         Ok(Primitive {
-            object,
-            material,
-            uv,
-            color,
+            key,
             start: self.offset,
             vertices: 0,
             triangles: 0,
@@ -98,7 +86,7 @@ impl Document {
     }
     fn vertex(&mut self, p: &mut Primitive, v: &[f32; 11], out: &mut impl Write) -> Res<u32> {
         let index = u32::try_from(p.vertices)?;
-        let (uv_end, color_start, stride) = layout(p.uv, p.color.is_some());
+        let (uv_end, color_start, stride) = layout(p.key.uv, p.key.colored);
         for n in v[..uv_end].iter().chain(&v[color_start..]) {
             out.write_all(&n.to_le_bytes())?;
         }
@@ -115,19 +103,19 @@ impl Document {
             // Vertices are only written for triangles, so the payload holds nothing for it.
             return Ok(());
         }
-        let (uv_end, _, stride) = layout(p.uv, p.color.is_some());
+        let (uv_end, _, stride) = layout(p.key.uv, p.key.colored);
         let view = self.views.len();
         self.views.push(json!({"buffer":0,"byteOffset":p.start,"byteLength":p.vertices * stride,"byteStride":stride,"target":34962}));
         let position = self.accessor(view, 0, 5126, p.vertices, "VEC3", Some((p.min, p.max)));
         let normal = self.accessor(view, 12, 5126, p.vertices, "VEC3", None);
         let mut attributes = json!({"POSITION":position,"NORMAL":normal});
-        if p.uv {
+        if p.key.uv {
             attributes["TEXCOORD_0"] =
                 json!(self.accessor(view, 24, 5126, p.vertices, "VEC2", None));
         }
-        if let Some(semantic) = p.color {
+        if p.key.colored {
             let offset = uv_end as u64 * 4;
-            attributes[semantic] =
+            attributes["COLOR_0"] =
                 json!(self.accessor(view, offset, 5126, p.vertices, "VEC3", None));
         }
         let mut spool = p.indices.into_inner().map_err(|e| e.into_error())?;
@@ -153,11 +141,11 @@ impl Document {
         self.offset += padding;
         let component = if short { 5123 } else { 5125 };
         let indices = self.accessor(index_view, 0, component, count, "SCALAR", None);
-        self.meshes[p.object]["primitives"]
+        self.meshes[p.key.object]["primitives"]
             .as_array_mut()
             .unwrap()
             .push(
-                json!({"attributes":attributes,"indices":indices,"material":p.material,"mode":4}),
+                json!({"attributes":attributes,"indices":indices,"material":p.key.material,"mode":4}),
             );
         Ok(())
     }
@@ -280,7 +268,7 @@ fn write_with_limit(
     Ok(())
 }
 /// Streams every face into `payload.bin` in the workspace, triangulated and deduplicated, in one
-/// primitive per run of faces sharing object, material and UV presence.
+/// primitive per run of faces sharing a `group::Key`.
 fn geometry(
     scene: &Scene,
     max_corners: u64,
@@ -294,11 +282,7 @@ fn geometry(
         map(&dir.join("vt"))?,
         map(&dir.join("vn"))?,
     ];
-    let colors = if scene.colors {
-        Some(map(&dir.join("vc"))?)
-    } else {
-        None
-    };
+    let colors = group::colors(scene, dir)?;
     let smooth = if scene.missing_normals {
         Some(crate::smooth::generate(scene, &attrs[0], dir, progress)?)
     } else {
@@ -322,40 +306,23 @@ fn geometry(
     let mut binary = BufWriter::with_capacity(256 * 1024, File::create(dir.join("payload.bin"))?);
     let mut open: Option<Primitive> = None;
     let mut face_count = 0u64;
-    let mut textured_colors = 0u64;
     let mut skipped_degenerate = 0u64;
     let mut forced_polygons = 0u64;
     let mut repaired_normals = 0u64;
     let mut splits = 0u64;
     let mut local = Vec::new();
-    while let Some(obj::Face {
-        object,
-        material,
-        flat,
-        corners,
-    }) = obj::read_face(&mut faces)?
-    {
+    while let Some(face) = obj::read_face(&mut faces)? {
         face_count += 1;
+        let (key, _) = group::key(scene, colors.as_deref(), &face)?;
+        let obj::Face { flat, corners, .. } = face;
         // Faces were validated by grouping: UV and normal presence is uniform per face.
-        let uv = corners[0].vt != 0;
+        let uv = key.uv;
         let normal = corners[0].vn != 0;
-        // glTF multiplies COLOR_0 into the base colour, which would tint a texture twice. Under
-        // a texture the colours are kept as `_COLOR` instead: glTF reserves a leading underscore
-        // for application-specific attributes, which renderers ignore, so the data survives.
-        // Faces without UVs use an untextured copy of their material, which COLOR_0 may tint.
-        let textured = scene.materials[material].texture.is_some() && uv;
-        let color = colors.as_ref();
-        let semantic = color.map(|_| if textured { "_COLOR" } else { "COLOR_0" });
-        textured_colors += u64::from(colors.is_some() && textured);
-        let key = (object, material, uv);
-        if open
-            .as_ref()
-            .is_none_or(|p| (p.object, p.material, p.uv) != key)
-        {
+        if open.as_ref().is_none_or(|p| p.key != key) {
             if let Some(p) = open.take() {
                 document.close(p, &mut binary)?;
             }
-            open = Some(document.open(&mut dedup, key, semantic)?);
+            open = Some(document.open(&mut dedup, key)?);
         }
         let mut positions = Vec::with_capacity(corners.len());
         let mut vertices = Vec::with_capacity(corners.len());
@@ -388,8 +355,9 @@ fn geometry(
                 v[6] = t[0] as f32;
                 v[7] = (1. - t[1]) as f32;
             }
-            if let Some(colors) = color {
-                let rgb = obj::fetch::<3>(colors, c.v, scene.counts[0])?.map(f64::from_le_bytes);
+            if let Some(colors) = colors.as_deref().filter(|_| key.colored) {
+                // A position without a colour, on a face where others have one, is white.
+                let rgb = obj::color(colors, c.v, scene.counts[0])?.unwrap_or([1.; 3]);
                 for i in 0..3 {
                     v[i + 8] = rgb[i] as f32;
                 }
@@ -439,7 +407,7 @@ fn geometry(
         if p.vertices + corners.len() as u64 > max_vertices {
             splits += 1;
             document.close(p, &mut binary)?;
-            p = document.open(&mut dedup, key, semantic)?;
+            p = document.open(&mut dedup, key)?;
         }
         local.clear();
         local.resize(corners.len(), None);
@@ -483,9 +451,6 @@ fn geometry(
     if repaired_normals > 0 {
         crate::say!("Warning: generated smooth normals for {repaired_normals} corners with zero-length source normals");
     }
-    if textured_colors > 0 {
-        crate::say!("Warning: vertex colors on {textured_colors} textured faces are kept as _COLOR, which renderers ignore, since COLOR_0 would tint the texture a second time; use --no-color to drop them");
-    }
     if skipped_degenerate > 0 {
         crate::say!("Warning: skipped {skipped_degenerate} faces with zero area");
     }
@@ -517,14 +482,17 @@ fn appearance(
     let mut extensions = BTreeSet::new();
     // A primitive without UVs cannot sample its material's texture, and glTF forbids it from
     // referencing one. It gets a copy of the material without the texture, as in obj2gltf
-    // (`splitIncompatibleMaterials`), so its colour factors still apply.
+    // (`splitIncompatibleMaterials`), so its colour factors still apply. A primitive whose
+    // vertex colours replace the diffuse colour (see `group::key`) gets a copy with a white base
+    // colour, since glTF multiplies `COLOR_0` into it.
     let variant = |p: &Value| {
         let material = p["material"].as_u64().unwrap() as usize;
-        let textured = scene.materials[material].texture.is_some()
-            && p["attributes"].get("TEXCOORD_0").is_some();
-        (material, textured)
+        let attributes = &p["attributes"];
+        let textured =
+            scene.materials[material].texture.is_some() && attributes.get("TEXCOORD_0").is_some();
+        (material, textured, attributes.get("COLOR_0").is_some())
     };
-    let used_materials: BTreeSet<(usize, bool)> = meshes
+    let used_materials: BTreeSet<(usize, bool, bool)> = meshes
         .iter()
         .flat_map(|mesh| mesh["primitives"].as_array().unwrap().iter().map(variant))
         .collect();
@@ -533,9 +501,9 @@ fn appearance(
     let mut invisible_names = Tally::new(
         "fully transparent materials, which will be invisible (d 0 or Tr 1; check whether the exporter writes Tr as opacity)",
     );
-    for &(old_id, textured) in &used_materials {
+    for &(old_id, textured, colored) in &used_materials {
         let m = &scene.materials[old_id];
-        material_ids.insert((old_id, textured), materials.len());
+        material_ids.insert((old_id, textured, colored), materials.len());
         let mut blend = false;
         let texture = if let Some(path) = m.texture.as_ref().filter(|_| textured) {
             let path =
@@ -571,7 +539,12 @@ fn appearance(
         if value["pbrMetallicRoughness"]["baseColorFactor"][3] == 0. && invisible.insert(old_id) {
             invisible_names.add(&m.name);
         }
-        if m.texture.is_some() && !textured {
+        if colored {
+            value["name"] = json!(format!("{}-vertex-colors", m.name));
+            for i in 0..3 {
+                value["pbrMetallicRoughness"]["baseColorFactor"][i] = json!(1.);
+            }
+        } else if m.texture.is_some() && !textured {
             value["name"] = json!(format!("{}-untextured", m.name));
         }
         if blend {
