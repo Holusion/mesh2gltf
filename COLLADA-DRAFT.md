@@ -1,0 +1,257 @@
+# COLLADA (`.dae`) import: draft
+
+Working note for the `collada-support` branch. Delete it before merging: the README and wiki
+take over once the behaviour exists.
+
+## Decisions
+
+1. XML is read with **`quick-xml` over a memory map of the input**.
+2. The COLLADA **node tree is kept** in the glTF; transforms aren't baked into positions.
+3. **`<unit meter>` is applied** as a scale on the root node, as three.js's ColladaLoader and
+   Blender's importer do.
+4. **`<up_axis>` is followed**: `Z_UP` gives the same rotation as `--up-axis z`, and an explicit
+   `--up-axis` overrides it with a note.
+5. **Missing textures keep the current rule**: an unreachable texture fails the conversion.
+6. **Identical materials are merged only if it is cheap**: see "Duplicate materials".
+7. **Blender's COLLADA importer is the reference** for appearance and placement; three.js only
+   where it plainly makes more sense.
+
+## What the samples contain
+
+The survey covers the 22 paths in `collada.txt`. The four D13–16 are identical copies and
+D19 is a directory, so there are 18 distinct files, from 878 B to 2.8 GB.
+It was produced by a streaming scanner (`survey_dae.py`, kept outside the repository) that
+records tags, attributes and small texts and samples the first 3,000 numbers of each array.
+
+| Sample | Size | Exporter | Up, unit | Shape of the data |
+| --- | --- | --- | --- | --- |
+| D11 | 2.8 GB | FreeCAD (pycollada)¹ | Z, m | 20,272 geometries, nodes, materials and effects, one each; identity nodes; `triangles` VERTEX+NORMAL |
+| D8 | 1.8 GB | FreeCAD (pycollada) | Z, m | Same pattern, 27,023 of each |
+| D6 | 945 MB | FreeCAD (pycollada) | Z, m | Same pattern, 955 of each |
+| D3 | 442 MB | FBX COLLADA exporter | Y, 0.001 (named "centimeter") | 287 geometries, VERTEX+NORMAL+TEXCOORD; node matrices up to 24,722 units; 11 significant digits; 60,942 stacked `<texture>` layers in one `diffuse` |
+| D9 | 226 MB | FreeCAD (pycollada) | Z, m | 1 geometry, 2.6 M positions; largest text node 115 MB (`<p>`) |
+| D4 | 176 MB | SketchUp 17 | Z, inch | 94,511 geometries, 71,480 of them `lines` only; 11,185 nodes, 5,145 `instance_node`, depth 8; positions up to 1.2·10⁷ in (315 km) |
+| D2 | 34 MB | LightWave | Y, 0.01 | **Truncated** inside a skin controller: no visual scene, no `</COLLADA>` |
+| D17 | 29 MB | Blender 2.75 | Z, m | `polylist` (triangles only), 5 `lines`; `transparency` 0.055 with no `<transparent>` |
+| D7 | 8.9 MB | SketchUp 17 | Z, inch | `triangles`, TEXCOORD without a `set` bound through `bind_vertex_input`; `RGB_ZERO` |
+| D22 | 5.6 MB | Blender 2.74 | Z, m | `polylist`, `double_sided` 1 (GOOGLEEARTH, MAX3D) |
+| D1 | 2.7 MB | SketchUp 17 | Z, inch | `library_nodes` + `instance_node`, `constant` and `lambert`, `lines` |
+| D12 | 2.0 MB | SketchUp 7 | Z, inch | `triangles`, `lambert`, 2 textures |
+| D21 | 1.3 MB | Assimp | Y, 0.01 | `polylist` with every input at offset 0, including TANGENT and BINORMAL |
+| D10 | 950 kB | FreeCAD (pycollada) | Z, m | 4 geometries |
+| D5 | 895 kB | (none) | no `asset` values | **Skinned**: 5 geometries reachable only through `instance_controller`; 127 joint nodes, depth 13 |
+| D13–16 | 758 kB | Blender 2.79 | Z, m | 1 geometry, cameras and lights |
+| D20 | 104 kB | FBX COLLADA exporter | Y, 0.0254 (named "centimeter") | Two TEXCOORD sets; no materials at all |
+| D18 | 878 B | FBX COLLADA exporter | Y, 0.01 | **Empty** visual scene |
+
+¹ No `authoring_tool`, but FreeCAD's `Part__Feature` ids and pycollada's output style.
+
+What this settles:
+
+- **All 1.4.1.** No 1.5 constructs (`instance_image`, `<init_from><ref>`) are needed yet.
+- **Primitives:** only `triangles`, `polylist` (largest polygon 32 corners) and `lines`. No
+  `polygons`, `ph`, `tristrips` or `trifans`. Those are omitted with a counted warning in the
+  first version; `polygons` without holes is cheap to add later on the `polylist` path.
+- **Inputs:** VERTEX, NORMAL and TEXCOORD, at separate offsets or all at offset 0. `<vertices>`
+  holds POSITION alone or POSITION+NORMAL (SketchUp), or POSITION+NORMAL+TEXCOORD (D5).
+  No COLOR anywhere, so vertex colors are left out of the first version. TANGENT and BINORMAL
+  (Assimp) and a second TEXCOORD set (FBX) are omitted with a counted warning.
+- **Scale:** the largest single text node is 115 MB and the largest accessor 2.6 M records, well
+  inside `u32`. The three biggest files hold 1–27 k small geometries. Heap is dominated by the
+  per-geometry, per-node and per-material records: 10⁵ of them in D4 and D8.
+- **Library order** differs: SketchUp writes `library_visual_scenes` before
+  `library_geometries`, everyone else after. That confirms the two passes.
+- **Reuse** happens only through `instance_node` (SketchUp components). No geometry is
+  instanced twice directly, and no geometry gets two different material bindings.
+- **Transforms:** only `<matrix>`. No `translate`, `rotate`, `scale`, `lookat` or `skew`.
+- **Units:** 7 samples aren't in metres (inch, cm, mm), so applying the unit matters.
+  The `meter` attribute is authoritative: FBX writes `name="centimeter"` with
+  `meter="0.001000"` and `meter="0.025400"`.
+- **Georeferencing:** D3 has 11-digit positions and large translations in its node matrices;
+  D4 has geometry 315 km out. Both go through the fixed-point path and the far origin.
+- **Materials:** `profile_COMMON` only: `phong` (FreeCAD, Blender, FBX, Assimp), `lambert`
+  (SketchUp, LightWave), `constant` (SketchUp). Every `shininess` is an exponent (0 to 1024);
+  no exporter uses a 0–1 scale. Textures are only in `diffuse`.
+- **Texture references:** `newparam surface/sampler2D` (Blender, SketchUp), an image id named
+  directly in `<texture texture>` (FBX), `bind_vertex_input UVSET0` (SketchUp), and
+  `texcoord="CHANNEL0"` with no binding (FBX). URIs: relative with `%20`, `file:///abs/...`,
+  and `file://C:/Users/...` (two slashes, a Windows path, unescaped spaces).
+- **Missing textures:** D13–16 (its images are in `Textures/`, not beside the file),
+  D1 (its texture folder is missing) and D3 (a path on the author's desktop).
+  D5's absolute `.tga` paths are found by name beside the file.
+
+## Architecture
+
+A new `src/dae.rs` that spools straight into the existing `v`, `vt`, `vn` and `faces` spools
+and returns a `Scene`, like `ply.rs`. Everything after `group::group` is unchanged except the
+node writer in `gltf.rs`.
+
+### Index pass
+
+`quick-xml`'s slice reader runs over a read-only mapping of the input. Text events borrow from
+the mapping, so a 115 MB `<p>` costs no heap, and `buffer_position()` gives byte ranges. One pass
+records:
+
+- Every `<source>` in a `<mesh>`: id, byte range of its `<float_array>`, accessor `count`,
+  `stride`, `offset` and which params are used.
+- Every `<vertices>`: its inputs.
+- Every primitive: kind, `count`, `material` symbol, inputs (semantic, offset, set, source),
+  byte ranges of `<vcount>` and `<p>`.
+- Materials, effects and images, reduced to a `Material` and an image URI as they stream past.
+  Only the first `<texture>` of a channel is kept: D3's 60,942 stacked layers are counted, not
+  stored.
+- Nodes: parent, composed matrix, `instance_geometry` (url plus `symbol → material` bindings),
+  `instance_node`, `instance_controller`. The `<scene>`'s `instance_visual_scene` picks the scene.
+- Controllers: a skin's `source` geometry and `bind_shape_matrix`.
+
+A truncated document (D2) or broken XML is an input error, exit 1.
+
+### Decode pass
+
+1. Resolve `#id` references. A dangling one is an error, since it leaves geometry unplaced. A
+   cycle of `instance_node` is an error.
+2. For each geometry used by the scene, in file order:
+   - Each source an input uses is parsed from its byte range into the matching global spool,
+     once, and its base index recorded. Positions go through `parse_decimal_fixed`, which
+     already accepts the `1.9e-10` forms LightWave writes.
+   - For each `triangles` or `polylist` primitive, `<p>` is read, and `<vcount>` in lockstep with a
+     second cursor on the same mapping. Corners become `Corner { v, vt, vn }` plus the bases.
+     Faces are written with the geometry as the object and the bound material.
+   - `lines` and other primitives are counted and omitted.
+3. A `<p>` shorter or longer than its `count`, a `vcount` total that disagrees with `<p>`, or an
+   index outside its source is an error: geometry would be wrong.
+
+Objects stay contiguous and each primitive has one material, so `group.rs` sees the same shape of
+face spool as for OBJ.
+
+### Scene graph and coordinates
+
+- Each COLLADA node becomes a glTF node with its `matrix` composed in `f64`. Nodes carrying
+  cameras or lights only, or meshes that ended up with no triangles (SketchUp's line-only
+  geometries), are pruned when their whole subtree is empty.
+- `instance_node` expands the library subtree into new glTF nodes (glTF nodes have one parent),
+  and their meshes are shared. D4 is the test for node count after expansion.
+- A geometry instanced with different material bindings keeps the first binding, with a counted
+  warning. No sample does this. Supporting it means another glTF mesh sharing the same accessors.
+- `instance_controller`: the skin's source geometry is placed with its `bind_shape_matrix`, which
+  is its bind pose. Joints, weights and animations are omitted with a warning. D5 is the
+  test; its placement is checked against Blender.
+- **Root node:** one node carrying the up-axis rotation and the unit scale, with the visual
+  scene's nodes as children. `--center` adds the translation that moves the scene-space
+  bounding-box center to 0.
+- **Origin:** positions stay relative to the global fixed-point origin, which is computed over
+  every geometry's local bounding box. A mesh-bearing node gets a child that holds the mesh and
+  translates by the origin, so `M·(p′ + o)` is restored under any matrix. The scene-space box for
+  `--center` and the reported bounds is each geometry's box through its node matrices: a
+  conservative box, not an exact one.
+- `gltf.rs` takes a node list (parent, matrix, mesh) from the `Scene`. OBJ, PLY and VRML give
+  the current flat list, so their output is unchanged.
+
+### Materials
+
+`instance_material symbol → target` → `material` → `instance_effect` → `effect`. `profile_COMMON`
+fills the existing `Material`, so the Phong→PBR policy, wiki Materials page and
+`extras.sourcePhong` carry over:
+
+| COLLADA | `Material` |
+| --- | --- |
+| `diffuse` color / first `<texture>` | `kd` / `texture`, with `kd = 1` when textured, as for PLY |
+| `specular`, `shininess` (exponent) | `ks`, `ns` |
+| `emission` | `ke` |
+| `transparent` + `transparency`, `A_ONE` (default) or `RGB_ZERO` | `opacity`, by the 1.4.1 spec formulas, checked against three.js and Blender |
+| `<constant>` | Unlit (`illum 0`) |
+| `<lambert>` | No specular (`illum 1`) |
+| `double_sided` in `<extra>` (GOOGLEEARTH, MAX3D) | `double_sided` |
+| `ambient`, `reflective`, `reflectivity`, `bump`, `index_of_refraction`, other profiles | Omitted, counted |
+
+`material.rs` needs a constructor for these fields, nothing more. A geometry without a binding,
+or a file without materials (D20), uses the default material.
+
+Texture lookup: `<texture texture="X">` goes through `newparam sampler2D` → `surface` →
+`init_from`, and falls back to an `<image>` with id `X` (FBX). The TEXCOORD set comes from
+`bind_vertex_input`, otherwise the first set. `<init_from>`: strip `file:` and its slashes,
+percent-decode, then `References::resolve`. Its lookup by name beside the model already covers
+`file://C:/Users/...` and D5's absolute paths.
+
+Points to settle against Blender's COLLADA importer on the samples. three.js's ColladaLoader
+wins only where it plainly makes more sense, and the code comment then says why:
+
+- **Transparency without `<transparent>`** (D17: 0.055 and 0.103). It reads either as
+  opacity, which would make the ring's stones nearly invisible, or as `1 − opacity`.
+- **FreeCAD's defaults:** `specular 1 1 1` with `shininess 0`, on every material of the three
+  largest samples. Under the MTL policy that is roughness 1 with a white `KHR_materials_specular`,
+  which may look washed out. Treating `shininess 0` as "no specular" is a possible rule.
+- **Color space** of effect colors: linear, as MTL's are here, unless reference renders disagree.
+
+### Out of scope for the first version
+
+`.zae` and `.kmz` archives, gzip-compressed `.dae`, external document references
+(`other.dae#id`), COLLADA 1.5, `polygons`/`tristrips`/`trifans`, vertex colors, a second UV set,
+skinning and animation, physics and kinematics.
+
+## Code changes
+
+| File | Change | Size |
+| --- | --- | --- |
+| `src/dae.rs` (new) | Index pass, reference resolution, decode pass, effects | ~800–1000 lines |
+| `src/main.rs`, `src/cli.rs` | `.dae` dispatch, help, `up_axis` default | small |
+| `src/gltf.rs` | Node list with hierarchy, matrices, root node, origin child nodes | ~100 lines |
+| `src/obj.rs` | `Scene` gains the node list; OBJ fills the flat one | small |
+| `src/material.rs` | Constructor for COLLADA effects | ~30 lines |
+| `src/fixed.rs` | Bounding box through a matrix, for `--center` and reported bounds | small |
+| `Cargo.toml` | `quick-xml` | 1 line |
+| `tests/import.rs` | One small inline `.dae` per mapping above | |
+| `tests/hostile.rs` | Truncation, dangling and cyclic references, `<p>` overruns, entity expansion, huge attributes | |
+| README | Formats, input list, exit codes, `--up-axis` default | |
+| Wiki | Geometry and format support → COLLADA; Materials → COLLADA materials; Canonical glTF profile → scene, root node, origin; Georeferenced coordinates → units and up axis; Disk-backed conversion → the two passes and the input map | |
+
+## Validation
+
+Every sample gets an expected outcome before the run:
+
+| Expected | Samples |
+| --- | --- |
+| Rejected, exit 1 | D2 (truncated), D18 (no geometry) |
+| Converts | the 13 other distinct files |
+| Fails on a missing texture (rule kept) | D13–16, D1, D3 |
+
+For each conversion:
+
+1. The Khronos validator (`tools/validate_gltf.cjs`) reports no errors.
+2. Triangle count, scene-space bounds in metres, and node, mesh, material and texture counts
+   match a reference import in Blender. three.js's ColladaLoader is the second opinion.
+3. Rendered comparison for textures, transparency and winding: SketchUp files, D17, D22,
+   D5, and one FreeCAD file.
+4. `tools/monitor_import.py` on D11, D8 and D6: flat heap, and time and
+   workspace use in line with an OBJ of the same size.
+
+## Duplicate materials (conditional)
+
+FreeCAD writes one material per part: 27,023 for D8, most of them likely identical.
+Merging materials that are equal in value is done **only if it is cheap**:
+
+- under 100 lines,
+- shared by every importer (after spooling, on `Scene::materials`, remapping the face spool's
+  material index during grouping rather than with an extra pass),
+- little to no time or memory cost: one hash of each material's effective values, which are
+  small per-material records already in memory.
+
+The material name then becomes the first source name, and the merge is reported in one line. If
+it can't meet those limits, materials stay one-to-one with the source, and that is recorded here.
+Measure on D8 first: if the 27,023 materials collapse to a handful, it is worth doing.
+
+## Implementation order
+
+Each step ends with `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test --locked` passing, and one commit.
+
+1. `gltf.rs` node list in `Scene`, with OBJ, PLY and VRML giving the flat list. Output must be
+   byte-identical for existing tests.
+2. `dae.rs` index pass and decode pass for `triangles` and `polylist`, default material, identity
+   nodes: the FreeCAD files convert.
+3. Node matrices, root node with unit scale and up axis, origin child nodes, `--center`.
+4. `instance_node` expansion and pruning: the SketchUp files convert.
+5. Effects, images and texture binding.
+6. `instance_controller` in bind pose: D5.
+7. Material deduplication, if it meets the limits above.
+8. Run every sample against the Validation table; README and wiki updates.
