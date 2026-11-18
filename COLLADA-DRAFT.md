@@ -5,6 +5,9 @@ take over once the behaviour exists.
 
 ## Decisions
 
+FBX support is planned on the `fbx-support` branch (`FBX-DRAFT.md`). It shares this branch's
+scene layer, so the layer below is shaped for both formats.
+
 1. XML is read with **`quick-xml` over a memory map of the input**.
 2. The COLLADA **node tree is kept** in the glTF; transforms aren't baked into positions.
 3. **`<unit meter>` is applied** as a scale on the root node, as three.js's ColladaLoader and
@@ -15,6 +18,9 @@ take over once the behaviour exists.
 6. **Identical materials are merged only if it is cheap**: see "Duplicate materials".
 7. **Blender's COLLADA importer is the reference** for appearance and placement; three.js only
    where it plainly makes more sense.
+8. **One scene layer for COLLADA and FBX**: see "Shared scene layer".
+9. **No feature flags and no scene-related options.** One binary. A second binary, for scenes,
+   only if scene-specific options ever become necessary; the default path stays simple.
 
 ## What the samples contain
 
@@ -124,28 +130,73 @@ A truncated document (D2) or broken XML is an input error, exit 1.
 Objects stay contiguous and each primitive has one material, so `group.rs` sees the same shape of
 face spool as for OBJ.
 
-### Scene graph and coordinates
+### Shared scene layer
 
-- Each COLLADA node becomes a glTF node with its `matrix` composed in `f64`. Nodes carrying
-  cameras or lights only, or meshes that ended up with no triangles (SketchUp's line-only
-  geometries), are pruned when their whole subtree is empty.
-- `instance_node` expands the library subtree into new glTF nodes (glTF nodes have one parent),
-  and their meshes are shared. D4 is the test for node count after expansion.
-- A geometry instanced with different material bindings keeps the first binding, with a counted
-  warning. No sample does this. Supporting it means another glTF mesh sharing the same accessors.
-- `instance_controller`: the skin's source geometry is placed with its `bind_shape_matrix`, which
-  is its bind pose. Joints, weights and animations are omitted with a warning. D5 is the
-  test; its placement is checked against Blender.
-- **Root node:** one node carrying the up-axis rotation and the unit scale, with the visual
-  scene's nodes as children. `--center` adds the translation that moves the scene-space
-  bounding-box center to 0.
-- **Origin:** positions stay relative to the global fixed-point origin, which is computed over
-  every geometry's local bounding box. A mesh-bearing node gets a child that holds the mesh and
-  translates by the origin, so `M·(p′ + o)` is restored under any matrix. The scene-space box for
-  `--center` and the reported bounds is each geometry's box through its node matrices: a
-  conservative box, not an exact one.
-- `gltf.rs` takes a node list (parent, matrix, mesh) from the `Scene`. OBJ, PLY and VRML give
-  the current flat list, so their output is unchanged.
+This layer is written once and used by COLLADA, FBX (planned in `FBX-DRAFT.md` on the
+`fbx-support` branch) and, later, VRML `Transform` and `USE`. It is shaped for FBX from the
+start, so that FBX adds an importer and no second scene model.
+
+`Scene` gains a node list and a root basis:
+
+```rust
+pub struct Node {
+    pub name: String,
+    pub parent: Option<u32>,
+    /// Local transform, column-major like glTF, composed in f64.
+    pub matrix: [f64; 16],
+    pub mesh: Option<Instance>,
+}
+pub struct Instance {
+    /// The geometry: an object of the face spool.
+    pub object: u32,
+    /// Applied to the geometry only, not to the node's children: COLLADA's `bind_shape_matrix`,
+    /// FBX's geometric transform. Identity otherwise.
+    pub geometry: [f64; 16],
+}
+pub struct Basis {
+    /// Source axes to glTF's: any signed permutation, so FBX's axis systems, left-handed ones
+    /// included, fit as well as COLLADA's `Y_UP` and `Z_UP`.
+    pub axes: [[f64; 3]; 3],
+    /// Metres per source unit: `<unit meter>`, FBX `UnitScaleFactor / 100` (centimetres per unit).
+    pub unit: f64,
+}
+```
+
+- **Root node:** one node carrying `Basis` (rotation or mirror, and the unit scale), with the
+  scene's top-level nodes as children. An explicit `--up-axis y|z` replaces the declared axes, with
+  a note. A left-handed source gives a root with a negative determinant; glTF then reverses the
+  winding, as its spec requires, so faces keep their side. `--center` adds the translation that
+  moves the scene-space bounding-box center to 0.
+- **Mesh child node:** a node with an instance gets a child holding the mesh, with matrix
+  `geometry · T(origin)`. The origin restores fixed-point positions under any matrix
+  (`M·G·(p′ + o)`), and the same child carries COLLADA's bind shape and FBX's geometric
+  transform. No second mechanism is needed for either.
+- **Origin:** positions stay relative to the global fixed-point origin, computed over every
+  geometry's local bounding box. The scene-space box for `--center` and the reported bounds is
+  each geometry's box through its full matrix chain: a conservative box, not an exact one.
+- **Reuse:** several nodes may instance one object, and its glTF mesh is shared. COLLADA's
+  `instance_node` and FBX's models sharing a geometry both end up here. A library subtree is
+  expanded into new glTF nodes, since glTF nodes have one parent. D4 is the test for node
+  count after expansion.
+- **Material binding:** faces record the material bound by the first instance of their object.
+  A later instance with a different binding keeps it, with one counted warning in every importer.
+  No COLLADA sample does this. FBX binds materials per model, so the FBX evaluation counts how
+  often it happens. If it matters, the fix is extra glTF meshes sharing the same accessors.
+- **Pruning:** nodes whose whole subtree carries no triangles are dropped: cameras, lights,
+  SketchUp's line-only geometries.
+- **Flat formats:** OBJ, PLY and VRML give one node per object, an identity basis and identity
+  instances, and their output stays byte-identical. `--up-axis z` becomes their basis.
+- **No scene-related flags.** The layer adds no option. One binary stays the default. If
+  scene-specific options ever become necessary, the split is a binary for simple imports and one
+  for scenes, sharing the core, rather than flags on the simple path.
+
+COLLADA specifics on top of the layer:
+
+- Each `<node>` becomes a `Node`, its `<matrix>` elements composed in order.
+- `instance_controller`: the skin's source geometry, with `bind_shape_matrix` as the instance's
+  `geometry` matrix, which is its bind pose. Joints, weights and animations are omitted with a
+  warning. D5 is the test; its placement is checked against Blender.
+- `Z_UP` and `Y_UP` are the two `Basis` values COLLADA can declare; `X_UP` is a third.
 
 ### Materials
 
@@ -164,7 +215,9 @@ fills the existing `Material`, so the Phong→PBR policy, wiki Materials page an
 | `double_sided` in `<extra>` (GOOGLEEARTH, MAX3D) | `double_sided` |
 | `ambient`, `reflective`, `reflectivity`, `bump`, `index_of_refraction`, other profiles | Omitted, counted |
 
-`material.rs` needs a constructor for these fields, nothing more. A geometry without a binding,
+`material.rs` needs a public constructor for Phong-style values (diffuse, specular, exponent,
+emission, opacity, texture, unlit or no-specular, double-sided), shared with FBX, whose
+Lambert and Phong properties map onto the same fields. Nothing more. A geometry without a binding,
 or a file without materials (D20), uses the default material.
 
 Texture lookup: `<texture texture="X">` goes through `newparam sampler2D` → `surface` →
@@ -195,10 +248,10 @@ skinning and animation, physics and kinematics.
 | --- | --- | --- |
 | `src/dae.rs` (new) | Index pass, reference resolution, decode pass, effects | ~800–1000 lines |
 | `src/main.rs`, `src/cli.rs` | `.dae` dispatch, help, `up_axis` default | small |
-| `src/gltf.rs` | Node list with hierarchy, matrices, root node, origin child nodes | ~100 lines |
-| `src/obj.rs` | `Scene` gains the node list; OBJ fills the flat one | small |
-| `src/material.rs` | Constructor for COLLADA effects | ~30 lines |
-| `src/fixed.rs` | Bounding box through a matrix, for `--center` and reported bounds | small |
+| `src/gltf.rs` | Shared scene layer: node list, root `Basis`, mesh child nodes with `geometry · T(origin)`, shared meshes, pruning | ~150 lines |
+| `src/obj.rs` | `Scene` gains `nodes` and `basis`; OBJ, PLY and VRML fill the flat ones | small |
+| `src/material.rs` | Phong-style constructor shared by COLLADA and FBX | ~30 lines |
+| `src/fixed.rs` | Bounding box through a matrix chain, for `--center` and reported bounds | small |
 | `Cargo.toml` | `quick-xml` | 1 line |
 | `tests/import.rs` | One small inline `.dae` per mapping above | |
 | `tests/hostile.rs` | Truncation, dangling and cyclic references, `<p>` overruns, entity expansion, huge attributes | |
@@ -245,11 +298,13 @@ Measure on D8 first: if the 27,023 materials collapse to a handful, it is worth 
 Each step ends with `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 `cargo test --locked` passing, and one commit.
 
-1. `gltf.rs` node list in `Scene`, with OBJ, PLY and VRML giving the flat list. Output must be
+1. The shared scene layer's types (`Node`, `Instance`, `Basis`) in `Scene` and the node writer in
+   `gltf.rs`, with OBJ, PLY and VRML giving the flat list. Output must be
    byte-identical for existing tests.
 2. `dae.rs` index pass and decode pass for `triangles` and `polylist`, default material, identity
    nodes: the FreeCAD files convert.
-3. Node matrices, root node with unit scale and up axis, origin child nodes, `--center`.
+3. Node matrices, root `Basis` (general axes, unit), mesh child nodes, `--center`. Test the
+   basis with a mirrored axis system too, although COLLADA can't declare one: FBX will.
 4. `instance_node` expansion and pruning: the SketchUp files convert.
 5. Effects, images and texture binding.
 6. `instance_controller` in bind pose: D5.
