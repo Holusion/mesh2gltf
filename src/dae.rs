@@ -513,6 +513,8 @@ struct Spools {
     vn: BufWriter<File>,
     faces: BufWriter<File>,
     counts: [u64; 3],
+    /// A zero normal was written: smooth normals must be generated for its corners, as for OBJ.
+    zero_normals: bool,
     /// Where each source spooled so far starts, as the index before its first record, and how
     /// many records it has.
     bases: HashMap<(String, Role), (u64, u64)>,
@@ -593,6 +595,7 @@ impl Spools {
                     } else {
                         &mut self.vt
                     };
+                    let mut zero = true;
                     for c in &wanted {
                         let t = tokens[*c as usize];
                         let v: f64 = t
@@ -600,8 +603,10 @@ impl Spools {
                             .ok()
                             .filter(|v: &f64| v.is_finite())
                             .ok_or_else(|| format!("Invalid COLLADA value: {}", safe(t)))?;
+                        zero &= v == 0.;
                         out.write_all(&v.to_le_bytes())?;
                     }
+                    self.zero_normals |= zero && role == Role::Normal;
                 }
             }
         }
@@ -751,6 +756,7 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
         vn: BufWriter::new(File::create(dir.join("vn"))?),
         faces: BufWriter::new(File::create(dir.join("faces"))?),
         counts: [0; 3],
+        zero_normals: false,
         bases: HashMap::new(),
     };
     let materials = vec![Material::new("default")];
@@ -794,7 +800,7 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
     }
     Ok(Scene {
         bbox,
-        missing_normals,
+        missing_normals: missing_normals || spools.zero_normals,
         colors: false,
         objects,
         materials,

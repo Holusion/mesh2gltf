@@ -1836,6 +1836,23 @@ fn collada_triangles_and_polylists_convert_under_one_root() {
     );
 }
 #[test]
+fn zero_collada_normals_are_smoothed() {
+    let f = Fixture::new();
+    let nodes = r##"<node name="A"><instance_geometry url="#tris"/></node>"##;
+    let zero = SQUARE.replace(">0 0 1</float_array>", ">0 0 0</float_array>");
+    f.file("in.dae", &dae("", &zero, nodes));
+    let result = f.import("in.dae", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, bin) = f.result();
+    let normals = &root["meshes"][0]["primitives"][0]["attributes"]["NORMAL"];
+    let normals = floats(&root, &bin, normals.as_u64().unwrap() as usize, 3);
+    assert!(normals.iter().all(|n| n == &[0., 0., 1.]), "{normals:?}");
+}
+#[test]
 fn broken_collada_is_rejected() {
     let nodes = r##"<node name="A"><instance_geometry url="#tris"/></node>"##;
     let whole = dae("", SQUARE, nodes);
