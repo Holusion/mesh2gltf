@@ -323,3 +323,101 @@ Each step ends with `cargo fmt --check`, `cargo clippy --all-targets -- -D warni
 6. `instance_controller` in bind pose: D5.
 7. Material deduplication, if it meets the limits above.
 8. Run every sample against the Validation table; README and wiki updates.
+
+## Status
+
+Phase 1 of the night run, on 2026-11-19. Each step passes `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings` and `cargo test --locked` (70 unit, 55 hostile and
+59 integration tests at the end).
+
+### Steps
+
+| Step | Commit | State |
+| --- | --- | --- |
+| 1. Shared scene layer | `f14265d` | Done. `src/scene.rs`: `Node`, `Instance`, `Basis`, `Graph` as specified, written under one root. Flat formats byte-identical on real OBJ, PLY and VRML files |
+| 2. `dae.rs` index and decode passes | `c46903b`, fix `4896705` | Done. The fix: zero source normals now ask for smooth normals, as for OBJ; D8 and D11 panicked without it |
+| 3. Transforms, basis, mesh child nodes, `--center` | `9c5fde8` | Done. `matrix`, `translate`, `rotate`, `scale`; `lookat` and `skew` rejected. Mirrored basis tested in step 1 |
+| 4. `instance_node` | `365dd7a` | Done. D4: 52,622 glTF nodes sharing 23,031 meshes |
+| 5. Effects, images, binding | `453ce37` | Done, with the reference change recorded under "Materials": Blender 5.2 has no COLLADA importer |
+| 6. `instance_controller` | `83c2ada` | Done. Skins at their bind shape at the root, morphs as their base under their node |
+| 7. Material merge | `05e910e` | Done within the limits: about 30 lines, shared, no measurable cost |
+| 8. Samples, README, wiki | — | Samples run (below). README and wiki not touched, as the night run was told |
+| Hardening | `7192aaf` | Expansion counted before it is built, 2^20-node cap, 1 MiB attributes, 4096-deep nesting, entity decoding in short texts |
+| Repair | `b946f9c` | Normal and UV indices past their source get a zero record (D3's exporter bug), positions still rejected |
+
+### Samples
+
+Converted with the final build into the worktree's `out/s/`. The three.js column is three.js
+0.186's ColladaLoader under Node; it counts a shared mesh once per placement, and doesn't skip
+zero-area faces. "Validator" is Khronos's.
+
+| # | Sample | Expected | Result | Triangles (three.js) | Bounds vs three.js | Validator | Time, peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | D1 | Missing texture | **Fails on its texture**, exit 1 | (19,266) | — | — | 0.3 s |
+| 2 | D2 | Rejected | **Rejected**, exit 1: truncated XML | (fails) | — | — | 0.4 s |
+| 3 | D3 | Missing texture | **Fails on its texture**, exit 1. A copy with placeholder images converts: 3,458,143 (3,458,374, less 231 zero-area faces skipped), 2.5 M normal indices past their source repaired | | Equal | 0 errors | 8.2 s, 427 MB |
+| 4 | D4 | Converts | **Converts**: 290,912 unique, 498,742 placed (498,746, less 4 zero-area) | | Equal | 0 errors, 5 image warnings | 3.8 s, 534 MB |
+| 5 | D5 | Converts | **Converts**: 9,141. Lies on its back: the file declares no up axis, and COLLADA's default is Y | (three.js fails on its skins) | — | Clean | 0.3 s |
+| 6 | D6 | Converts | **Converts**: 11,758,012; 955 materials merged to 1 | — | — | Clean | 31.9 s, 910 MB |
+| 7 | D7 | Converts | **Converts**: 78,073 (78,073) | | Equal | 0 errors, 1 image warning | 0.3 s |
+| 8 | D8 | Converts | **Converts**: 22,155,442; 27,023 materials merged to 23 | — | — | Clean | 63.7 s, 1,897 MB |
+| 9 | D9 | Converts | **Converts**: 2,610,828 (2,611,499, less 671 zero-area) | | Equal | Clean | 7.1 s, 305 MB |
+| 10 | D10 | Converts | **Converts**: 13,842 (13,842) | | Equal | Clean | 0.0 s |
+| 11 | D11 | Converts | **Converts**: 37,306,623; 4,473 materials merged to 34 | — | — | Can't load the 3.0 GB `.bin` (`IO_ERROR`: Node's 2 GiB file limit) | 101 s, 2,749 MB |
+| 12 | D12 | Converts | **Converts**: 35,312 (35,312) | | Equal | Clean (2 infos) | 0.1 s |
+| 13–16 | D13–16 | Missing texture | **Fail on their texture**, exit 1 | (5,372) | — | — | 0.0 s |
+| 17 | D17 | Converts | **Converts**: 187,283 (187,296, less 13 zero-area) | | Equal | Clean | 0.7 s |
+| 18 | D18 | Rejected | **Rejected**, exit 1: no geometry | (0) | — | — | 0.0 s |
+| 19 | D19 | — | A directory, skipped | | | | |
+| 20 | D20 | Converts | **Converts**: 593 (595, less 2 zero-area) | | Equal | Clean | 0.0 s |
+| 21 | D21 | Converts | **Converts**: 12,220 (12,220) | | Equal | Clean | 0.0 s |
+| 22 | D22 | Converts | **Converts**: 58,746 (60,327, less 1,581 zero-area) | | Equal | Clean | 0.2 s |
+
+Every outcome matches the Validation table. Every triangle-count difference with three.js is the
+zero-area faces mesh2gltf already skips, and every scene bound three.js gives matches to the
+millimetre. Peak RSS includes the mapped input and spools, which are page cache; see "Memory".
+
+### Memory
+
+`tools/monitor_import.py` on the three largest samples, final build. RSS includes the mapped
+input and spools, which are evictable page cache; the heap is the importer's own (`RssAnon`).
+
+| Sample | Input | Time | Peak RSS | Peak heap |
+| --- | --- | --- | --- | --- |
+| D6 (955 parts) | 945 MB | 33 s | 910 MiB | 14 MiB |
+| D8 (27,023 parts) | 1.85 GB | 63 s | 1,883 MiB | 417 MiB |
+| D11 (20,272 parts) | 2.81 GB | 100 s | 2,773 MiB | 303 MiB |
+
+The heap doesn't follow the geometry: D6's 11.8 M triangles take 14 MiB. It follows the part
+count. On D8 it holds at 115–137 MiB while reading and converting, which is the
+first pass's records, about 4–5 KiB per part (ids, sources, effects, nodes). It reaches 417 MiB
+only in the last seconds, when `gltf.rs` builds the whole glTF JSON as a `serde_json::Value`
+tree before writing it: about 13 KiB per mesh, for a 32 MB file. That cost is the existing
+writer's, and an OBJ with as many objects pays it too. Writing the JSON as it goes, or from
+compact records, would remove it.
+
+### Open problems
+
+1. **One origin for every geometry.** D4's geometry spans 2.8 million inches in its own
+   coordinates, and its components move it back; with one global origin, float32 keeps about
+   6 mm there. An origin per object, which the mesh child node already restores, would keep full
+   detail at no cost in nodes. That changes the "Shared scene layer" decision, so it is left for
+   you.
+2. **No Blender 4.5 renders.** The material rules come from Blender 4.5's source and three.js; no
+   image was compared. A Blender 4.5 build (the `blender-headless` recipe targets 4.5.7) would
+   give the reference renders the plan asked for.
+3. **`dae.rs` is 1,451 lines**, above the 800–1,000 estimate. `rustfmt` spreads the index pass's
+   match arms; a table-driven pass for the small-text elements would shrink it.
+4. **The validator can't read a `.bin` over 2 GiB** (D11): a limit of the tool, not of the
+   output. The other two largest outputs validate clean.
+5. **D17's stones are nearly invisible** (alpha 0.055), as both references read them. Blender
+   2.7 exported its material alpha this way for ray-traced glass, which glTF can't express.
+6. **Merged materials lose their other names.** Recording them would cost JSON size on files like
+   D8.
+7. **Not handled, and not seen in the samples:** `polygons`, `tristrips`, `trifans`, vertex colours,
+   a second UV set, COLLADA 1.5, non-UTF-8 documents (quick-xml reads UTF-8 only).
+8. **The glTF JSON is built whole in memory** (see "Memory"): 417 MiB of heap for D8's
+   27,014 meshes. Not COLLADA-specific, but scene formats with tens of thousands of parts make
+   it the largest heap user.
+9. **Documentation still to do:** README (formats, `--up-axis`, exit codes), AGENTS.md's code
+   layout (`dae.rs`, `scene.rs`), and the wiki pages listed under "Code changes".
