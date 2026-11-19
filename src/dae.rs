@@ -33,8 +33,10 @@ use std::{
 };
 /// Bounds the text of an element read whole: a matrix, a colour, a file name.
 const MAX_TEXT: usize = 1024 * 1024;
+/// Bounds element nesting: real files nest a few dozen deep.
+const MAX_DEPTH: usize = 4096;
 /// Bounds the node tree once `instance_node` references are expanded, which can multiply it.
-const MAX_NODES: usize = 1 << 22;
+const MAX_NODES: usize = 1 << 20;
 /// Elements whose text is read whole, as opposed to the big arrays, which are only located.
 const SMALL_TEXT: &[&str] = &[
     "matrix",
@@ -153,6 +155,9 @@ fn local(url: &str) -> Res<&str> {
 fn attribute(e: &BytesStart, name: &str) -> Res<Option<String>> {
     for a in e.attributes() {
         let a = a?;
+        if a.value.len() > MAX_TEXT {
+            return Err("COLLADA attribute exceeds 1 MiB".into());
+        }
         if a.key.local_name().as_ref() == name {
             return Ok(Some(
                 a.normalized_value(XmlVersion::Implicit1_0)?.into_owned(),
@@ -508,6 +513,9 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                     }
                     _ => {}
                 }
+                if stack.len() == MAX_DEPTH {
+                    return Err("COLLADA elements nest too deep".into());
+                }
                 stack.push(name);
                 text.clear();
                 span = position(&reader)..position(&reader);
@@ -524,7 +532,28 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                     text.push_str(&t);
                 }
             }
-            Event::GeneralRef(_) | Event::CData(_) | Event::Comment(_) => {
+            Event::GeneralRef(r) => {
+                span.end = position(&reader);
+                if stack
+                    .last()
+                    .is_some_and(|n| SMALL_TEXT.contains(&n.as_str()))
+                {
+                    // The predefined entities and character references; a document declares
+                    // no others that a reader must expand, and expanding them is how entity
+                    // bombs work.
+                    match (
+                        r.resolve_char_ref()?,
+                        quick_xml::escape::resolve_predefined_entity(&r),
+                    ) {
+                        (Some(c), _) => text.push(c),
+                        (None, Some(s)) => text.push_str(s),
+                        (None, None) => {
+                            return Err(format!("Unknown COLLADA entity &{};", safe(&r)).into())
+                        }
+                    }
+                }
+            }
+            Event::CData(_) | Event::Comment(_) => {
                 span.end = position(&reader);
             }
             Event::End(_) => {
@@ -655,6 +684,50 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
         return Err("COLLADA document ends before its last element closes".into());
     }
     Ok(doc)
+}
+/// How many output nodes each node becomes, at most, once `instance_node` references are expanded,
+/// counted without expanding them, so that a small file can't claim a huge scene. Only what the
+/// scene's `roots` reach is counted: there, a node that instances itself, directly or not, and a
+/// reference to no node, are errors.
+fn expanded_sizes(doc: &Document, children: &[Vec<usize>], roots: &[usize]) -> Res<Vec<u64>> {
+    let mut sizes = vec![0u64; doc.nodes.len()];
+    // 0: not reached, 1: being counted, 2: counted.
+    let mut state = vec![0u8; doc.nodes.len()];
+    for &start in roots {
+        let mut stack = vec![(start, false)];
+        while let Some((n, counted)) = stack.pop() {
+            let node = &doc.nodes[n];
+            let mut targets = Vec::with_capacity(node.instances.len());
+            for url in &node.instances {
+                let t = doc.node_ids.get(url);
+                targets.push(*t.ok_or_else(|| format!("COLLADA node {} is missing", safe(url)))?);
+            }
+            let next = children[n].iter().chain(&targets);
+            if counted {
+                // The node, a child node per instance beyond the first, and its subtrees.
+                let own = 1 + node.geometries.len() as u64;
+                sizes[n] = next.fold(own, |s, &c| s.saturating_add(sizes[c]));
+                state[n] = 2;
+                continue;
+            }
+            if state[n] != 0 {
+                continue;
+            }
+            state[n] = 1;
+            stack.push((n, true));
+            for &c in next {
+                match state[c] {
+                    0 => stack.push((c, false)),
+                    1 => {
+                        let name = &doc.nodes[c].name;
+                        return Err(format!("COLLADA node {} instances itself", safe(name)).into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(sizes)
 }
 /// The geometry an instance shows, and for a skin, its bind shape matrix. A controller names a
 /// geometry or another controller: a morph's base shape is shown, without its targets, and a
@@ -1031,26 +1104,26 @@ fn decode(
     // The geometry each node instances, and the instance's geometry matrix.
     let mut instanced: Vec<Option<(usize, Matrix)>> = Vec::new();
     let mut bindings: HashMap<usize, &[(String, String)]> = HashMap::new();
-    // A node to place, its parent in the output, and the `instance_node` targets being expanded
-    // around it, as a link in `chains`, to catch a node that instances itself.
-    let mut pending: Vec<(usize, Option<u32>, Option<usize>)> = visual
-        .roots
-        .iter()
-        .rev()
-        .map(|&r| (r, None, None))
-        .collect();
-    let mut chains: Vec<(usize, Option<usize>)> = Vec::new();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); doc.nodes.len()];
     for (i, n) in doc.nodes.iter().enumerate() {
         if let Some(p) = n.parent {
             children[p].push(i);
         }
     }
-    while let Some((n, parent, chain)) = pending.pop() {
+    let sizes = expanded_sizes(doc, &children, &visual.roots)?;
+    let total = visual
+        .roots
+        .iter()
+        .map(|&r| sizes[r])
+        .fold(0, u64::saturating_add);
+    if total > MAX_NODES as u64 {
+        return Err("COLLADA scene has too many nodes once instance_node is expanded".into());
+    }
+    // A node to place, and its parent in the output.
+    let mut pending: Vec<(usize, Option<u32>)> =
+        visual.roots.iter().rev().map(|&r| (r, None)).collect();
+    while let Some((n, parent)) = pending.pop() {
         let source = &doc.nodes[n];
-        if nodes.len() == MAX_NODES {
-            return Err("COLLADA scene has too many nodes once instance_node is expanded".into());
-        }
         let at = u32::try_from(nodes.len())?;
         nodes.push(Node {
             name: source.name.clone(),
@@ -1094,22 +1167,10 @@ fn decode(
             }
         }
         for url in source.instances.iter().rev() {
-            let target = *doc
-                .node_ids
-                .get(url)
-                .ok_or_else(|| format!("COLLADA node {} is missing", safe(url)))?;
-            let mut link = chain;
-            while let Some(l) = link {
-                if chains[l].0 == target {
-                    return Err(format!("COLLADA node {} instances itself", safe(url)).into());
-                }
-                link = chains[l].1;
-            }
-            chains.push((target, chain));
-            pending.push((target, Some(at), Some(chains.len() - 1)));
+            pending.push((doc.node_ids[url], Some(at)));
         }
         for &c in children[n].iter().rev() {
-            pending.push((c, Some(at), chain));
+            pending.push((c, Some(at)));
         }
     }
     // Objects in file order, so that the decode pass reads the map front to back.

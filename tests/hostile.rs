@@ -1051,6 +1051,14 @@ fn file(name: &str, body: impl Into<Vec<u8>>) -> (String, Vec<u8>) {
 }
 /// `HOSTILE` at each place a parser takes text from. The flag says the import's messages have to
 /// show it, so that the check is known to reach the message and not a silent success.
+/// A COLLADA document with this asset content and these visual scene nodes.
+fn collada(asset: &str, nodes: &str) -> String {
+    format!(
+        r##"<COLLADA version="1.4.1"><asset>{asset}</asset>
+        <library_visual_scenes><visual_scene id="s">{nodes}</visual_scene></library_visual_scenes>
+        <scene><instance_visual_scene url="#s"/></scene></COLLADA>"##
+    )
+}
 fn hostile_text() -> Vec<(&'static str, Files, bool)> {
     let h = HOSTILE;
     let obj = |body: String| ("m.obj", vec![file("m.obj", body)], true);
@@ -1109,6 +1117,36 @@ fn hostile_text() -> Vec<(&'static str, Files, bool)> {
             false,
         ),
     ];
+    // In XML, `<` has to be escaped for the text to be read at all.
+    let x = h.replace('<', "&lt;");
+    let dae = |body: String, shown: bool| ("m.dae", vec![file("m.dae", body)], shown);
+    cases.extend([
+        dae(
+            collada(
+                "",
+                &format!(r##"<node><instance_geometry url="#{x}"/></node>"##),
+            ),
+            true,
+        ),
+        dae(collada(&format!("<up_axis>{x}</up_axis>"), ""), true),
+        dae(
+            collada(
+                "",
+                &format!(r#"<node name="{x}"><matrix>{x}</matrix></node>"#),
+            ),
+            true,
+        ),
+        dae(collada("", &format!("<node>{h}</node>")), false),
+        dae(format!("<{h}/>"), false),
+        (
+            "m.dae",
+            vec![file(
+                "m.dae",
+                &b"<COLLADA><asset><up_axis>\xff\x1b[31m</up_axis></asset></COLLADA>"[..],
+            )],
+            false,
+        ),
+    ]);
     // Windows doesn't allow these names.
     if cfg!(unix) {
         let name: &'static str = format!("{h}.obj").leak();
@@ -1414,5 +1452,55 @@ fn a_missing_input_is_named() {
         let stderr = u.stderr_of(&[name, "-o", "out.gltf"]);
         assert!(stderr.starts_with(&format!("Error: {name}: ")), "{stderr}");
         assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    }
+}
+#[test]
+fn collada_entities_nesting_and_expansion_are_bounded() {
+    let u = Upload::new();
+    // An entity bomb: nothing but the predefined entities is expanded.
+    let mut bomb = String::from(r#"<?xml version="1.0"?><!DOCTYPE COLLADA [<!ENTITY e0 "lol">"#);
+    for i in 1..10 {
+        let tens = format!("&e{};", i - 1).repeat(10);
+        bomb.push_str(&format!(r#"<!ENTITY e{i} "{tens}">"#));
+    }
+    bomb.push_str("]>");
+    u.write(
+        "bomb.dae",
+        &(bomb + &collada("<up_axis>&e9;</up_axis>", "")),
+    );
+    let deep = format!(
+        "{}{}",
+        "<extra>".repeat(100_000),
+        "</extra>".repeat(100_000)
+    );
+    u.write("deep.dae", &collada("", &deep));
+    let long = "x".repeat(2 << 20);
+    u.write(
+        "long.dae",
+        &collada("", &format!(r#"<node name="{long}"/>"#)),
+    );
+    // Each component instances the one before twice: 2^40 placements.
+    let mut library = String::from(r#"<library_nodes><node id="n0"/>"#);
+    for i in 1..=40 {
+        let j = i - 1;
+        library.push_str(&format!(
+            r##"<node id="n{i}"><instance_node url="#n{j}"/><instance_node url="#n{j}"/></node>"##
+        ));
+    }
+    library.push_str("</library_nodes>");
+    let doubling = collada("", r##"<node><instance_node url="#n40"/></node>"##).replace(
+        "<library_visual_scenes>",
+        &format!("{library}<library_visual_scenes>"),
+    );
+    u.write("doubling.dae", &doubling);
+    for input in ["bomb.dae", "deep.dae", "long.dae", "doubling.dae"] {
+        let out = u.run(&[input, "-o", "out.gltf"]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{input}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_few_lines(&String::from_utf8_lossy(&out.stderr));
     }
 }

@@ -2292,3 +2292,28 @@ fn materials_equal_but_for_their_name_are_merged() {
     // One primitive for the two faces of the merged materials.
     assert_eq!(root["meshes"][0]["primitives"].as_array().unwrap().len(), 2);
 }
+#[test]
+fn collada_entities_in_a_texture_name_are_decoded() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("my maps")).unwrap();
+    image::RgbImage::new(1, 1)
+        .save(f.0.join("my maps/a&b.png"))
+        .unwrap();
+    let effects = EFFECTS.replace("my%20maps/wood.png", "my%20maps/a&amp;b.png");
+    f.file(
+        "in.dae",
+        &dae(
+            "",
+            &format!("{effects}{}", material_geometries()),
+            &material_nodes(),
+        ),
+    );
+    let result = f.import("in.dae", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, _) = f.result();
+    assert_eq!(root["images"][0]["uri"], "my%20maps/a%26b.png");
+}
