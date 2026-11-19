@@ -15,6 +15,7 @@ mod material;
 mod obj;
 mod ply;
 mod references;
+mod scene;
 mod smooth;
 mod triangulate;
 mod vrml;
@@ -56,6 +57,8 @@ pub struct Options {
     pub tmp_dir: PathBuf,
     pub center: bool,
     pub z_up: bool,
+    /// `--up-axis` was given: it replaces the axes a scene format declares.
+    pub up_axis_explicit: bool,
     pub progress: bool,
     pub keep_tmp: bool,
     pub images: images::Options,

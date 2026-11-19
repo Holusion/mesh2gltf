@@ -10,6 +10,7 @@ use crate::{
     group::{self, Group, Key},
     images::Plan,
     obj::{self, Scene},
+    scene::{self, Basis},
     triangulate, Res,
 };
 use serde_json::{json, Map, Value};
@@ -24,6 +25,9 @@ use std::{
 pub const SHORT_VERTICES: u64 = u16::MAX as u64;
 pub const MAX_VERTICES: u64 = u32::MAX as u64;
 pub const COORDINATE_CONVENTION: &str = "Source units preserved (assumed metres); no CRS inferred";
+/// For scene formats, whose files declare their unit.
+pub const SCENE_COORDINATE_CONVENTION: &str =
+    "Source units scaled to metres by the root node; no CRS inferred";
 /// Floats per vertex up to the end of the UV, and where the colour starts (11 when absent).
 fn layout(uv: bool, color: bool) -> (usize, usize, u64) {
     let uv_end = if uv { 8 } else { 6 };
@@ -174,8 +178,9 @@ fn write_with_limit(
     let (center, z_up) = (options.center, options.z_up);
     let transparency = crate::images::scan_transparency(&images);
     // Positions are stored relative to `origin`. A model far from 0 keeps its place through a
-    // node translation; `--center` drops it instead.
-    let (origin, translated) = if center {
+    // node translation; `--center` drops it instead. A scene's root node centers it, since its
+    // geometry sits under transforms: there the origin only keeps float32's detail.
+    let (origin, translated) = if center && scene.graph.is_none() {
         (scene.bbox.center().ok_or("No vertices to center")?, false)
     } else if let Some(origin) = scene.bbox.far_origin() {
         (origin, true)
@@ -200,8 +205,10 @@ fn write_with_limit(
     if document.offset == 0 {
         return Err("Input contains no supported triangle geometry".into());
     }
-    if translated {
+    if translated && scene.graph.is_none() {
         crate::say!("Note: the model is far from 0 for its size; positions are relative to the origin, which each node's translation restores (--center drops it)");
+    } else if translated {
+        crate::say!("Note: geometry is far from 0 for its size; positions are relative to the origin, which each mesh node's translation restores");
     }
     let transparent = transparency
         .join()
@@ -227,7 +234,39 @@ fn write_with_limit(
     });
     let mut meshes = Vec::new();
     let mut nodes = Vec::new();
-    for mesh in document.meshes {
+    let mut scene_extras = None;
+    if let Some(graph) = &scene.graph {
+        let mut ids = Vec::with_capacity(document.meshes.len());
+        for mesh in std::mem::take(&mut document.meshes) {
+            let empty = mesh["primitives"].as_array().unwrap().is_empty();
+            ids.push((!empty).then_some(meshes.len()));
+            if !empty {
+                meshes.push(mesh);
+            }
+        }
+        let basis = if options.up_axis_explicit {
+            crate::say!("Note: --up-axis replaces the axes the file declares");
+            Basis {
+                axes: if z_up { Basis::Z_UP } else { Basis::Y_UP },
+                ..graph.basis
+            }
+        } else {
+            graph.basis
+        };
+        let origin = origin.map(|v| format_fixed_as_decimal(v).parse::<f64>().unwrap());
+        let written = scene::write(graph, &basis, &ids, origin, center)?;
+        if let Some((min, max)) = written.bounds {
+            let show = |p: [f64; 3]| p.map(|v| format!("{v:.3}")).join(" ");
+            crate::say!(
+                "Scene bounds in metres, Y up: {} → {}",
+                show(min),
+                show(max)
+            );
+        }
+        nodes = written.nodes;
+        scene_extras = Some(json!({"axes": basis.axes, "metresPerUnit": basis.unit}));
+    }
+    for mesh in std::mem::take(&mut document.meshes) {
         if !mesh["primitives"].as_array().unwrap().is_empty() {
             let mut node = json!({"name":mesh["name"],"mesh":meshes.len()});
             if z_up {
@@ -244,11 +283,23 @@ fn write_with_limit(
     let mesh_count = meshes.len();
     let bin_path = output.with_extension("bin");
     let origin_strings = origin.map(format_fixed_as_decimal);
+    // A scene has one root node, which holds the rest.
+    let roots: Vec<usize> = if scene_extras.is_some() {
+        vec![0]
+    } else {
+        (0..nodes.len()).collect()
+    };
     let mut root = json!({"asset":{"version":"2.0","generator":concat!("mesh2gltf ",env!("CARGO_PKG_VERSION"))},
-        "scene":0,"scenes":[{"nodes":(0..nodes.len()).collect::<Vec<_>>()}],"nodes":nodes,"meshes":meshes,
+        "scene":0,"scenes":[{"nodes":roots}],"nodes":nodes,"meshes":meshes,
         "buffers":[{"uri":uri(&bin_path.file_name().unwrap().to_string_lossy()),"byteLength":document.offset}],
         "bufferViews":document.views,"accessors":document.accessors,
         "extras":{"mesh2gltf":{"origin":origin_strings,"sourceBounds":scene.bbox.record(),"centered":center,"sourceUpAxis":if z_up {"z"} else {"y"},"coordinateConvention":COORDINATE_CONVENTION}}});
+    if let Some(basis) = scene_extras {
+        let extras = &mut root["extras"]["mesh2gltf"];
+        extras.as_object_mut().unwrap().remove("sourceUpAxis");
+        extras["sourceBasis"] = basis;
+        extras["coordinateConvention"] = json!(SCENE_COORDINATE_CONVENTION);
+    }
     root.as_object_mut().unwrap().extend(look);
     let mut dst = BufWriter::new(outputs.create(&bin_path)?);
     std::io::copy(&mut File::open(dir.join("payload.bin"))?, &mut dst)?;
@@ -591,8 +642,14 @@ pub fn uri(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::{material::Origin, references::References};
-    /// Primitive vertex counts after importing `obj` with a lowered vertex limit.
-    fn import_with_limit(obj: &str, limit: u64) -> Vec<u64> {
+    /// The glTF of `obj`, imported with a lowered vertex limit, and with the node tree `graph`
+    /// gives it.
+    fn import(
+        obj: &str,
+        limit: u64,
+        center: bool,
+        graph: impl FnOnce(&Scene) -> Option<scene::Graph>,
+    ) -> Value {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "mesh2gltf-split-{}-{}",
@@ -607,9 +664,10 @@ mod tests {
             input: input.clone(),
             output: output.clone(),
             tmp_dir: dir.clone(),
+            center,
             ..Default::default()
         };
-        let scene = obj::spool(
+        let mut scene = obj::spool(
             &input,
             &dir,
             false,
@@ -618,10 +676,16 @@ mod tests {
             true,
         )
         .unwrap();
+        scene.graph = graph(&scene);
         let groups = crate::group::group(&scene, &dir, false).unwrap();
         write_with_limit(scene, &groups, HashMap::new(), &dir, &options, limit).unwrap();
         let root: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+        root
+    }
+    /// Primitive vertex counts after importing `obj` with a lowered vertex limit.
+    fn import_with_limit(obj: &str, limit: u64) -> Vec<u64> {
+        let root = import(obj, limit, false, |_| None);
         let primitives = root["meshes"][0]["primitives"].as_array().unwrap();
         let accessors = &root["accessors"];
         primitives
@@ -638,5 +702,81 @@ mod tests {
         assert_eq!(import_with_limit(obj, 6), [4]);
         // The second face could add three vertices, which would pass the limit.
         assert_eq!(import_with_limit(obj, 5), [3, 3]);
+    }
+    fn node(
+        name: &str,
+        parent: Option<u32>,
+        matrix: scene::Matrix,
+        mesh: Option<(u32, scene::Matrix)>,
+    ) -> scene::Node {
+        scene::Node {
+            name: name.into(),
+            parent,
+            matrix,
+            mesh: mesh.map(|(object, geometry)| scene::Instance { object, geometry }),
+        }
+    }
+    /// Object `a` has a triangle, object `b` none.
+    const TWO_OBJECTS: &str = "o a\nv 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\no b\n";
+    fn graph(mirror: bool) -> impl FnOnce(&Scene) -> Option<scene::Graph> {
+        move |s: &Scene| {
+            use scene::{translation, IDENTITY};
+            let mut a = crate::fixed::BBox::new();
+            for p in [[0, 0, 0], [2, 0, 0], [0, 2, 0]] {
+                a.add(p.map(|v: i64| v * SCALE as i64));
+            }
+            assert_eq!(s.objects, ["default", "a", "b"]);
+            let x = if mirror { -1. } else { 1. };
+            Some(scene::Graph {
+                name: "scene".into(),
+                nodes: vec![
+                    node("top", None, translation([10., 0., 0.]), None),
+                    node("a1", Some(0), IDENTITY, Some((1, IDENTITY))),
+                    node("camera", Some(0), translation([1., 1., 1.]), None),
+                    node("a2", None, IDENTITY, Some((1, translation([0., 0., 5.])))),
+                    node("empty", None, IDENTITY, Some((2, IDENTITY))),
+                ],
+                basis: Basis {
+                    axes: [[x, 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                    unit: 0.5,
+                },
+                bounds: vec![crate::fixed::BBox::new(), a, crate::fixed::BBox::new()],
+            })
+        }
+    }
+    #[test]
+    fn scene_nodes_share_meshes_and_drop_empty_subtrees() {
+        let root = import(TWO_OBJECTS, MAX_VERTICES, false, graph(true));
+        assert_eq!(root["scenes"][0]["nodes"], json!([0]));
+        assert_eq!(root["meshes"].as_array().unwrap().len(), 1);
+        let nodes = root["nodes"].as_array().unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        // The camera and the mesh without triangles are gone; a2's geometry matrix needs a child.
+        assert_eq!(names, ["scene", "top", "a1", "a2", "a2"]);
+        // A mirrored source: the root's determinant is negative, and glTF reverses the winding.
+        assert_eq!(
+            nodes[0]["matrix"],
+            json!([-0.5, 0., 0., 0., 0., 0.5, 0., 0., 0., 0., 0.5, 0., 0., 0., 0., 1.])
+        );
+        assert_eq!(nodes[0]["children"], json!([1, 3]));
+        assert_eq!(nodes[1]["children"], json!([2]));
+        assert_eq!(nodes[2]["mesh"], 0);
+        assert!(nodes[3].get("mesh").is_none());
+        assert_eq!(nodes[3]["children"], json!([4]));
+        assert_eq!(nodes[4]["mesh"], 0);
+        assert_eq!(nodes[4]["matrix"][14], 5.);
+        assert!(root["extras"]["mesh2gltf"].get("sourceUpAxis").is_none());
+        assert_eq!(
+            root["extras"]["mesh2gltf"]["sourceBasis"]["metresPerUnit"],
+            0.5
+        );
+    }
+    #[test]
+    fn center_moves_the_scene_bounds_center_to_zero() {
+        let root = import(TWO_OBJECTS, MAX_VERTICES, true, graph(false));
+        // Scene-space x spans a1 (10..12) and a2 (0..2), so 0..12 scaled by 0.5: centre 3.
+        let m = &root["nodes"][0]["matrix"];
+        assert_eq!(m[12], -3.);
+        assert_eq!(m[13], -0.5);
     }
 }

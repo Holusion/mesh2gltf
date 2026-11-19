@@ -612,6 +612,7 @@ pub fn spool(
             uv_count,
             if normals { vertex.count } else { 0 },
         ],
+        graph: None,
     })
 }
 #[cfg(test)]

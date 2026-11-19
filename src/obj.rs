@@ -43,6 +43,8 @@ pub struct Scene {
     pub objects: Vec<String>,
     pub materials: Vec<Material>,
     pub counts: [u64; 3],
+    /// The node tree of a scene format. Flat formats have none: one node per object.
+    pub graph: Option<crate::scene::Graph>,
 }
 fn index(raw: &str, count: u64) -> Res<u64> {
     let n: i64 = raw.parse()?;
@@ -133,6 +135,7 @@ pub fn spool(
         objects: vec!["default".into()],
         materials: vec![Material::new("default")],
         counts: [0; 3],
+        graph: None,
     };
     let mut definitions = HashMap::new();
     let mut names = HashMap::from([("default".to_owned(), 0u32)]);

@@ -13,6 +13,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
     let mut tmp_dir = None;
     let mut center = false;
     let mut z_up = false;
+    let mut up_axis_explicit = false;
     let mut progress = false;
     let mut keep_tmp = false;
     let mut no_color = false;
@@ -36,6 +37,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
             }
             "--center" => center = true,
             "--up-axis" => {
+                up_axis_explicit = true;
                 z_up = match args.next().as_deref() {
                     Some("y") => false,
                     Some("z") => true,
@@ -75,6 +77,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
         tmp_dir,
         center,
         z_up,
+        up_axis_explicit,
         progress,
         keep_tmp,
         images,

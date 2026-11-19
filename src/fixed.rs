@@ -265,6 +265,13 @@ impl BBox {
         }))
     }
 
+    /// `(min, max)` as floating-point source coordinates, for transforming the box.
+    pub fn as_f64(&self) -> Option<([f64; 3], [f64; 3])> {
+        let (min, max) = self.bounds?;
+        let f = |c: [i64; 3]| c.map(|v| v as f64 / SCALE as f64);
+        Some((f(min), f(max)))
+    }
+
     /// `min → max`, for human-readable output.
     pub fn range_str(&self) -> Option<String> {
         let (min, max) = self.bounds?;

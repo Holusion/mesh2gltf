@@ -184,8 +184,11 @@ pub struct Basis {
   often it happens. If it matters, the fix is extra glTF meshes sharing the same accessors.
 - **Pruning:** nodes whose whole subtree carries no triangles are dropped: cameras, lights,
   SketchUp's line-only geometries.
-- **Flat formats:** OBJ, PLY and VRML give one node per object, an identity basis and identity
-  instances, and their output stays byte-identical. `--up-axis z` becomes their basis.
+- **Flat formats:** OBJ, PLY and VRML have no graph (`Scene::graph` is `None`), and `gltf.rs`
+  keeps writing one node per object for them, with `--up-axis z` and the origin on each node.
+  Routing them through the graph would add a root node and change their output, so they stay on
+  the existing path, byte-identical (checked on real OBJ and PLY files and a VRML file).
+  Implemented in `src/scene.rs`.
 - **No scene-related flags.** The layer adds no option. One binary stays the default. If
   scene-specific options ever become necessary, the split is a binary for simple imports and one
   for scenes, sharing the core, rather than flags on the simple path.
