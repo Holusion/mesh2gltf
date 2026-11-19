@@ -2011,3 +2011,64 @@ fn georeferenced_collada_keeps_its_digits_under_node_transforms() {
     };
     assert!((0..3).all(|i| mid(i).abs() < 1e-6), "{vertices:?}");
 }
+/// A component in `library_nodes`, as SketchUp writes them.
+const COMPONENT: &str = r##"<library_nodes><node id="comp" name="Component">
+    <node name="Part"><translate>0 0 1</translate><instance_geometry url="#tris"/></node>
+  </node></library_nodes>"##;
+#[test]
+fn collada_instance_nodes_repeat_a_subtree_and_share_its_mesh() {
+    let f = Fixture::new();
+    let nodes = r##"<node name="Left"><instance_node url="#comp"/></node>
+        <node name="Right"><translate>5 0 0</translate><instance_node url="#comp"/></node>"##;
+    f.file("in.dae", &dae("", &format!("{COMPONENT}{SQUARE}"), nodes));
+    let result = f.import("in.dae", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, bin) = f.result();
+    let names: Vec<_> = root["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Scene",
+            "Left",
+            "Component",
+            "Part",
+            "Right",
+            "Component",
+            "Part"
+        ]
+    );
+    assert_eq!(root["meshes"].as_array().unwrap().len(), 1);
+    let corners = placed(&root, &bin, 0);
+    // The component's part, one unit along z, in both places.
+    assert!(
+        corners.iter().any(|v| close(*v, [1., 1., 1.], 1e-9)),
+        "{corners:?}"
+    );
+    assert!(
+        corners.iter().any(|v| close(*v, [6., 1., 1.], 1e-9)),
+        "{corners:?}"
+    );
+}
+#[test]
+fn a_collada_node_instancing_itself_is_rejected() {
+    let f = Fixture::new();
+    let looping = COMPONENT.replace(
+        r##"<instance_geometry url="#tris"/>"##,
+        r##"<instance_node url="#comp"/>"##,
+    );
+    let nodes = r##"<node name="Left"><instance_node url="#comp"/></node>"##;
+    f.file("in.dae", &dae("", &format!("{looping}{SQUARE}"), nodes));
+    let result = f.import("in.dae", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("instances itself"), "{stderr}");
+}

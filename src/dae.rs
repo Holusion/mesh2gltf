@@ -79,6 +79,8 @@ struct DaeNode {
     /// The node's transforms, composed in document order: each applies before the ones above.
     matrix: Matrix,
     geometries: Vec<Instanced>,
+    /// `instance_node` targets: other nodes whose subtrees are repeated here.
+    instances: Vec<String>,
 }
 struct VisualScene {
     name: String,
@@ -93,6 +95,7 @@ struct Document {
     geometries: Vec<Geometry>,
     geometry_ids: HashMap<String, usize>,
     nodes: Vec<DaeNode>,
+    node_ids: HashMap<String, usize>,
     visual_scenes: HashMap<String, VisualScene>,
     first_visual_scene: Option<String>,
     scene: Option<String>,
@@ -236,6 +239,8 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
     let mut array: Option<(String, u64)> = None;
     let mut node_stack: Vec<usize> = Vec::new();
     let mut visual_scene: Option<String> = None;
+    // Inside `library_nodes`, whose nodes are only placed where `instance_node` puts them.
+    let mut in_library = false;
     let mut instance: Option<Instanced> = None;
     let position = |reader: &Reader<&[u8]>| reader.buffer_position() as usize;
     loop {
@@ -338,14 +343,10 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                         );
                         visual_scene = Some(id);
                     }
+                    (Some("library_nodes"), "node") | (Some("node"), "node") if in_library => {
+                        start_node(&mut doc, &e, &mut node_stack)?;
+                    }
                     (Some("visual_scene" | "node"), "node") if visual_scene.is_some() => {
-                        if doc.nodes.len() == MAX_NODES {
-                            return Err("COLLADA scene has too many nodes".into());
-                        }
-                        let id = attribute(&e, "id")?;
-                        let name = attribute(&e, "name")?
-                            .or(id)
-                            .unwrap_or_else(|| "node".into());
                         let parent = node_stack.last().copied();
                         if parent.is_none() {
                             let scene = visual_scene.as_ref().unwrap();
@@ -355,13 +356,12 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                                 .roots
                                 .push(doc.nodes.len());
                         }
-                        node_stack.push(doc.nodes.len());
-                        doc.nodes.push(DaeNode {
-                            name,
-                            parent,
-                            matrix: IDENTITY,
-                            geometries: Vec::new(),
-                        });
+                        start_node(&mut doc, &e, &mut node_stack)?;
+                    }
+                    (Some("COLLADA"), "library_nodes") => in_library = true,
+                    (Some("node"), "instance_node") if !node_stack.is_empty() => {
+                        let url = local(&attribute(&e, "url")?.unwrap_or_default())?.to_owned();
+                        doc.nodes[*node_stack.last().unwrap()].instances.push(url);
                     }
                     (Some("node"), "instance_geometry") if !node_stack.is_empty() => {
                         instance = Some(Instanced {
@@ -387,7 +387,7 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                         if library.starts_with("library_")
                             && !matches!(
                                 library,
-                                "library_geometries" | "library_visual_scenes"
+                                "library_geometries" | "library_visual_scenes" | "library_nodes"
                             ) =>
                     {
                         unsupported.add(library);
@@ -475,9 +475,10 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                             doc.nodes[n].geometries.push(i);
                         }
                     }
-                    (_, "node") if visual_scene.is_some() => {
+                    (_, "node") if visual_scene.is_some() || in_library => {
                         node_stack.pop();
                     }
+                    (Some("COLLADA"), "library_nodes") => in_library = false,
                     (Some("library_visual_scenes"), "visual_scene") => visual_scene = None,
                     _ => {}
                 }
@@ -491,6 +492,28 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
         return Err("COLLADA document ends before its last element closes".into());
     }
     Ok(doc)
+}
+/// A `<node>`, under the one at the top of `stack`.
+fn start_node(doc: &mut Document, e: &BytesStart, stack: &mut Vec<usize>) -> Res<()> {
+    if doc.nodes.len() == MAX_NODES {
+        return Err("COLLADA scene has too many nodes".into());
+    }
+    let id = attribute(e, "id")?;
+    let name = attribute(e, "name")?
+        .or_else(|| id.clone())
+        .unwrap_or_else(|| "node".into());
+    if let Some(id) = id {
+        doc.node_ids.insert(id, doc.nodes.len());
+    }
+    stack.push(doc.nodes.len());
+    doc.nodes.push(DaeNode {
+        name,
+        parent: stack.iter().rev().nth(1).copied(),
+        matrix: IDENTITY,
+        geometries: Vec::new(),
+        instances: Vec::new(),
+    });
+    Ok(())
 }
 fn read_input(e: &BytesStart) -> Res<Input> {
     Ok(Input {
@@ -687,16 +710,26 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
     let mut nodes: Vec<Node> = Vec::new();
     let mut instanced: Vec<Option<usize>> = Vec::new();
     let mut bindings: HashMap<usize, &[(String, String)]> = HashMap::new();
-    let mut pending: Vec<(usize, Option<u32>)> =
-        visual.roots.iter().rev().map(|&r| (r, None)).collect();
+    // A node to place, its parent in the output, and the `instance_node` targets being expanded
+    // around it, as a link in `chains`, to catch a node that instances itself.
+    let mut pending: Vec<(usize, Option<u32>, Option<usize>)> = visual
+        .roots
+        .iter()
+        .rev()
+        .map(|&r| (r, None, None))
+        .collect();
+    let mut chains: Vec<(usize, Option<usize>)> = Vec::new();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); doc.nodes.len()];
     for (i, n) in doc.nodes.iter().enumerate() {
         if let Some(p) = n.parent {
             children[p].push(i);
         }
     }
-    while let Some((n, parent)) = pending.pop() {
+    while let Some((n, parent, chain)) = pending.pop() {
         let source = &doc.nodes[n];
+        if nodes.len() == MAX_NODES {
+            return Err("COLLADA scene has too many nodes once instance_node is expanded".into());
+        }
         let at = u32::try_from(nodes.len())?;
         nodes.push(Node {
             name: source.name.clone(),
@@ -729,8 +762,23 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
                 return Err("COLLADA scene has too many nodes".into());
             }
         }
+        for url in source.instances.iter().rev() {
+            let target = *doc
+                .node_ids
+                .get(url)
+                .ok_or_else(|| format!("COLLADA node {} is missing", safe(url)))?;
+            let mut link = chain;
+            while let Some(l) = link {
+                if chains[l].0 == target {
+                    return Err(format!("COLLADA node {} instances itself", safe(url)).into());
+                }
+                link = chains[l].1;
+            }
+            chains.push((target, chain));
+            pending.push((target, Some(at), Some(chains.len() - 1)));
+        }
         for &c in children[n].iter().rev() {
-            pending.push((c, Some(at)));
+            pending.push((c, Some(at), chain));
         }
     }
     // Objects in file order, so that the decode pass reads the map front to back.
