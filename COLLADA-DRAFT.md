@@ -207,37 +207,40 @@ COLLADA specifics on top of the layer:
 fills the existing `Material`, so the Phong→PBR policy, wiki Materials page and
 `extras.sourcePhong` carry over:
 
-| COLLADA | `Material` |
-| --- | --- |
-| `diffuse` color / first `<texture>` | `kd` / `texture`, with `kd = 1` when textured, as for PLY |
-| `specular`, `shininess` (exponent) | `ks`, `ns` |
-| `emission` | `ke` |
-| `transparent` + `transparency`, `A_ONE` (default) or `RGB_ZERO` | `opacity`, by the 1.4.1 spec formulas, checked against three.js and Blender |
-| `<constant>` | Unlit (`illum 0`) |
-| `<lambert>` | No specular (`illum 1`) |
-| `double_sided` in `<extra>` (GOOGLEEARTH, MAX3D) | `double_sided` |
-| `ambient`, `reflective`, `reflectivity`, `bump`, `index_of_refraction`, other profiles | Omitted, counted |
+**The reference.** Blender 5.2, the only Blender on the machine, no longer has a COLLADA
+importer (Blender removed it in 5.0). The reference is therefore Blender 4.5's importer read
+from its source (`source/blender/io/collada/Materials.cpp`, `MaterialNode`), with three.js
+0.186's ColladaLoader (`ColladaComposer.js`) as the second opinion. Renders against Blender 4.5
+are still to do, once a 4.5 build is installed.
 
-`material.rs` needs a public constructor for Phong-style values (diffuse, specular, exponent,
-emission, opacity, texture, unlit or no-specular, double-sided), shared with FBX, whose
-Lambert and Phong properties map onto the same fields. Nothing more. A geometry without a binding,
-or a file without materials (D20), uses the default material.
+| COLLADA | `Material` | Following |
+| --- | --- | --- |
+| `diffuse` color / first `<texture>` | `kd` / `texture` with `kd = 1`: the texture replaces the colour. Neither: black | Blender |
+| `specular` | Black or absent: specular off (`illum 1`). Otherwise the default dielectric specular, not its value | Blender |
+| `shininess` | `ns`, a Phong exponent, mapped to roughness as for MTL. Absent: roughness 0.5 | three.js, which uses it; Blender ignores it pending a rework, with roughness 0.5 |
+| `emission` | `ke` | Both |
+| `transparent` + `transparency` | Alpha = `transparent.a × transparency`, each 1 when absent | Blender (three.js agrees) |
+| `RGB_ZERO` | Alpha = 1 − luminance(`transparent.rgb`) × `transparency` | The 1.4.1 spec and three.js (for grey): Blender's `1 − a × t` makes SketchUp's grey glass invisible |
+| `reflectivity` | Ignored | three.js: Blender makes it metalness, which would make every D3 material metal; mesh2gltf infers no metal |
+| `<constant>` | Unlit (`illum 0`) | three.js (MeshBasicMaterial) and the spec |
+| `<lambert>` | No specular (`illum 1`) | Both |
+| `double_sided` in `<extra>` (GOOGLEEARTH, MAX3D) | `double_sided` | three.js; Blender has no backface culling to set |
+| Colour space | Linear, as for MTL | Blender; three.js reads them as sRGB |
+| `ambient`, `reflective`, `bump`, `index_of_refraction`, textures on other channels, stacked diffuse textures, other profiles | Omitted, counted | |
+
+Consequences on the samples: D17's stones, `transparency 0.055` with no `<transparent>`, are
+nearly invisible in both Blender and three.js, and so here. FreeCAD's `specular 1 1 1` with
+`shininess 0` gives a matte part with ordinary specular.
+
+`material.rs` needed no change: the fields COLLADA sets are already public. FBX can use them
+the same way.
 
 Texture lookup: `<texture texture="X">` goes through `newparam sampler2D` → `surface` →
-`init_from`, and falls back to an `<image>` with id `X` (FBX). The TEXCOORD set comes from
-`bind_vertex_input`, otherwise the first set. `<init_from>`: strip `file:` and its slashes,
-percent-decode, then `References::resolve`. Its lookup by name beside the model already covers
-`file://C:/Users/...` and D5's absolute paths.
-
-Points to settle against Blender's COLLADA importer on the samples. three.js's ColladaLoader
-wins only where it plainly makes more sense, and the code comment then says why:
-
-- **Transparency without `<transparent>`** (D17: 0.055 and 0.103). It reads either as
-  opacity, which would make the ring's stones nearly invisible, or as `1 − opacity`.
-- **FreeCAD's defaults:** `specular 1 1 1` with `shininess 0`, on every material of the three
-  largest samples. Under the MTL policy that is roughness 1 with a white `KHR_materials_specular`,
-  which may look washed out. Treating `shininess 0` as "no specular" is a possible rule.
-- **Color space** of effect colors: linear, as MTL's are here, unless reference renders disagree.
+`init_from`, and falls back to an `<image>` with id `X` (FBX). The TEXCOORD set is the lowest:
+every sample binds set 0, or has one set. `<init_from>`: `file:` and its slashes go, escapes
+are decoded, then `References::resolve`, whose lookup by name beside the model covers
+`file://C:/Users/...` and D5's absolute paths. An image id that names nothing omits the
+texture with a counted warning; a file that can't be reached fails the conversion.
 
 ### Out of scope for the first version
 

@@ -36,7 +36,20 @@ const MAX_TEXT: usize = 1024 * 1024;
 /// Bounds the node tree once `instance_node` references are expanded, which can multiply it.
 const MAX_NODES: usize = 1 << 22;
 /// Elements whose text is read whole, as opposed to the big arrays, which are only located.
-const SMALL_TEXT: &[&str] = &["matrix", "translate", "rotate", "scale", "up_axis"];
+const SMALL_TEXT: &[&str] = &[
+    "matrix",
+    "translate",
+    "rotate",
+    "scale",
+    "up_axis",
+    "color",
+    "float",
+    "init_from",
+    "source",
+    "double_sided",
+];
+/// The `profile_COMMON` shading models, which hold one element per channel.
+const MODELS: &[&str] = &["constant", "lambert", "phong", "blinn"];
 
 /// `<accessor>`: how the records of a source sit in its array.
 struct Accessor {
@@ -82,6 +95,23 @@ struct DaeNode {
     /// `instance_node` targets: other nodes whose subtrees are repeated here.
     instances: Vec<String>,
 }
+/// What `profile_COMMON` says of a surface, as far as glTF can show it.
+#[derive(Default)]
+struct Effect {
+    model: String,
+    diffuse: Option<[f64; 4]>,
+    /// The `texture` attribute of the first diffuse `<texture>`: a sampler, or an image.
+    texture: Option<String>,
+    specular: Option<[f64; 4]>,
+    shininess: Option<f64>,
+    emission: Option<[f64; 4]>,
+    transparent: Option<[f64; 4]>,
+    opaque: Option<String>,
+    transparency: Option<f64>,
+    double_sided: bool,
+    /// `newparam` sids: a `sampler2D`'s surface, a `surface`'s image.
+    params: HashMap<String, String>,
+}
 struct VisualScene {
     name: String,
     roots: Vec<usize>,
@@ -99,6 +129,11 @@ struct Document {
     visual_scenes: HashMap<String, VisualScene>,
     first_visual_scene: Option<String>,
     scene: Option<String>,
+    /// Material id → its name and its effect's id.
+    materials: HashMap<String, (String, String)>,
+    effects: HashMap<String, Effect>,
+    /// Image id → the URI of its file.
+    images: HashMap<String, String>,
 }
 /// `#id` → `id`. A reference to another document can't be followed.
 fn local(url: &str) -> Res<&str> {
@@ -242,6 +277,10 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
     // Inside `library_nodes`, whose nodes are only placed where `instance_node` puts them.
     let mut in_library = false;
     let mut instance: Option<Instanced> = None;
+    let mut material: Option<String> = None;
+    let mut effect: Option<String> = None;
+    let mut param: Option<String> = None;
+    let mut image: Option<String> = None;
     let position = |reader: &Reader<&[u8]>| reader.buffer_position() as usize;
     loop {
         let event = reader.read_event().map_err(|e| {
@@ -380,6 +419,51 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                     {
                         unsupported.add(other);
                     }
+                    (Some("library_materials"), "material") => {
+                        let id = attribute(&e, "id")?.unwrap_or_default();
+                        let name = attribute(&e, "name")?.unwrap_or_else(|| id.clone());
+                        doc.materials.insert(id.clone(), (name, String::new()));
+                        material = Some(id);
+                    }
+                    (Some("material"), "instance_effect") if material.is_some() => {
+                        let url = local(&attribute(&e, "url")?.unwrap_or_default())?.to_owned();
+                        doc.materials.get_mut(material.as_ref().unwrap()).unwrap().1 = url;
+                    }
+                    (Some("library_effects"), "effect") => {
+                        let id = attribute(&e, "id")?.unwrap_or_default();
+                        doc.effects.insert(id.clone(), Effect::default());
+                        effect = Some(id);
+                    }
+                    (Some("effect"), profile)
+                        if profile.starts_with("profile_") && profile != "profile_COMMON" =>
+                    {
+                        unsupported.add(profile);
+                    }
+                    (Some(_), "newparam") if effect.is_some() => param = attribute(&e, "sid")?,
+                    (Some("technique"), model)
+                        if effect.is_some()
+                            && MODELS.contains(&model)
+                            && stack.iter().any(|n| n == "profile_COMMON") =>
+                    {
+                        doc.effects.get_mut(effect.as_ref().unwrap()).unwrap().model = model.into();
+                    }
+                    (Some(channel), "texture") if effect.is_some() && in_model(&stack) => {
+                        let fx = doc.effects.get_mut(effect.as_ref().unwrap()).unwrap();
+                        match channel {
+                            "diffuse" if fx.texture.is_none() => {
+                                fx.texture = Some(attribute(&e, "texture")?.unwrap_or_default());
+                            }
+                            "diffuse" => unsupported.add("stacked diffuse textures"),
+                            other => unsupported.add(&format!("{other} texture")),
+                        }
+                    }
+                    (Some(model), "transparent") if effect.is_some() && MODELS.contains(&model) => {
+                        doc.effects
+                            .get_mut(effect.as_ref().unwrap())
+                            .unwrap()
+                            .opaque = attribute(&e, "opaque")?;
+                    }
+                    (Some(_), "image") => image = attribute(&e, "id")?,
                     (Some("scene"), "instance_visual_scene") => {
                         doc.scene = Some(local(&attribute(&e, "url")?.unwrap_or_default())?.into());
                     }
@@ -387,7 +471,12 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                         if library.starts_with("library_")
                             && !matches!(
                                 library,
-                                "library_geometries" | "library_visual_scenes" | "library_nodes"
+                                "library_geometries"
+                                    | "library_visual_scenes"
+                                    | "library_nodes"
+                                    | "library_materials"
+                                    | "library_effects"
+                                    | "library_images"
                             ) =>
                     {
                         unsupported.add(library);
@@ -480,6 +569,48 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                     }
                     (Some("COLLADA"), "library_nodes") => in_library = false,
                     (Some("library_visual_scenes"), "visual_scene") => visual_scene = None,
+                    (Some(channel), value @ ("color" | "float"))
+                        if effect.is_some() && in_model(&stack) =>
+                    {
+                        let fx = doc.effects.get_mut(effect.as_ref().unwrap()).unwrap();
+                        if value == "color" {
+                            let c = floats(&text, 4, "color")?;
+                            let c = Some([c[0], c[1], c[2], c[3]]);
+                            match channel {
+                                "diffuse" => fx.diffuse = c,
+                                "specular" => fx.specular = c,
+                                "emission" => fx.emission = c,
+                                "transparent" => fx.transparent = c,
+                                _ => {}
+                            }
+                        } else {
+                            let v = floats(&text, 1, "float")?[0];
+                            match channel {
+                                "shininess" => fx.shininess = Some(v),
+                                "transparency" => fx.transparency = Some(v),
+                                _ => {}
+                            }
+                        }
+                    }
+                    (Some("surface"), "init_from") | (Some("sampler2D"), "source")
+                        if effect.is_some() && param.is_some() =>
+                    {
+                        let fx = doc.effects.get_mut(effect.as_ref().unwrap()).unwrap();
+                        fx.params
+                            .insert(param.clone().unwrap(), text.trim().to_owned());
+                    }
+                    (Some("image"), "init_from") if image.is_some() => {
+                        doc.images
+                            .insert(image.clone().unwrap(), text.trim().to_owned());
+                    }
+                    (_, "double_sided") if effect.is_some() => {
+                        let fx = doc.effects.get_mut(effect.as_ref().unwrap()).unwrap();
+                        fx.double_sided |= text.trim() == "1";
+                    }
+                    (_, "newparam") => param = None,
+                    (_, "image") => image = None,
+                    (Some("library_effects"), "effect") => effect = None,
+                    (Some("library_materials"), "material") => material = None,
                     _ => {}
                 }
                 text.clear();
@@ -492,6 +623,122 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
         return Err("COLLADA document ends before its last element closes".into());
     }
     Ok(doc)
+}
+/// Whether the top of `stack` is a channel of a `profile_COMMON` shading model.
+fn in_model(stack: &[String]) -> bool {
+    stack.len() >= 2 && MODELS.contains(&stack[stack.len() - 2].as_str())
+}
+/// Coverage as Blender's importer computes it (`MaterialNode::set_alpha`, after COLLADA 1.4.1's
+/// "Determining Transparency"): the `transparent` colour's alpha times `transparency`, either
+/// being 1 when absent. Under `RGB_ZERO`, though, the colour's luminance is used, as the spec
+/// says and as three.js's ColladaLoader does for grey: Blender uses the alpha there, which makes
+/// SketchUp's grey glass, `0.48 0.48 0.48 1`, invisible.
+fn opacity(fx: &Effect) -> f64 {
+    let t = fx.transparency.unwrap_or(1.);
+    let c = fx.transparent.unwrap_or([1.; 4]);
+    let luminance = 0.212671 * c[0] + 0.715160 * c[1] + 0.072169 * c[2];
+    let alpha = match fx.opaque.as_deref() {
+        Some("RGB_ZERO") => 1. - luminance * t,
+        Some("A_ZERO") => 1. - c[3] * t,
+        Some("RGB_ONE") => luminance * t,
+        _ => c[3] * t,
+    };
+    alpha.clamp(0., 1.)
+}
+/// A file reference from an `<init_from>` URI: `file:` and its slashes go, and escapes are
+/// decoded. What is left may be an absolute Windows path, which `References` looks up by name.
+fn file_reference(uri: &str) -> String {
+    let mut s = uri.trim();
+    if let Some(rest) = s.strip_prefix("file:") {
+        s = rest.strip_prefix("//").unwrap_or(rest);
+        let b = s.as_bytes();
+        // `file:///C:/x`: the drive comes after the slash.
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            s = &s[1..];
+        }
+    }
+    let mut bytes = Vec::with_capacity(s.len());
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            raw[i],
+            raw.get(i + 1).and_then(|b| hex(*b)),
+            raw.get(i + 2).and_then(|b| hex(*b)),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                bytes.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                bytes.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+/// The glTF-facing material of a COLLADA material, following Blender's importer
+/// (`MaterialNode`), except where noted:
+/// - The diffuse texture replaces the diffuse colour; without either, the surface is black.
+/// - A black or absent specular colour turns specular off, and any other leaves the default
+///   dielectric specular: Blender doesn't use its value.
+/// - `shininess` is a Phong exponent, mapped to roughness as for MTL, as three.js uses it; Blender
+///   ignores it, pending a rework, and keeps a roughness of 0.5, used here when it is absent.
+/// - `reflectivity` is not made metalness, which Blender does: no metal is inferred.
+/// - `constant` is unlit, and `lambert` has no specular.
+/// - `double_sided` in an `<extra>` sets `doubleSided`, as three.js reads it.
+fn build_material(
+    doc: &Document,
+    id: &str,
+    base: &Path,
+    references: &References,
+    warnings: &mut Warnings,
+) -> Res<Option<Material>> {
+    let Some((name, effect)) = doc.materials.get(id) else {
+        warnings.missing.add(id);
+        return Ok(None);
+    };
+    let Some(fx) = doc.effects.get(effect) else {
+        warnings.missing.add(id);
+        return Ok(None);
+    };
+    let rgb = |c: [f64; 4]| [c[0], c[1], c[2]].map(|v| v.clamp(0., 1.));
+    let mut m = Material::new(name);
+    m.kd = fx.diffuse.map_or([0.; 3], rgb);
+    m.ke = fx.emission.map_or([0.; 3], rgb);
+    let specular = fx.specular.is_some_and(|c| rgb(c) != [0.; 3]);
+    m.illum = match fx.model.as_str() {
+        "constant" => 0,
+        "phong" | "blinn" if specular => 2,
+        _ => 1,
+    };
+    match fx.shininess {
+        Some(ns) => m.ns = ns.max(0.),
+        None => m.roughness = Some(0.5),
+    }
+    m.opacity = opacity(fx);
+    m.double_sided = fx.double_sided;
+    if let Some(texture) = &fx.texture {
+        // A sampler names a surface, which names an image; FBX's exporter names the image.
+        let mut image = texture.as_str();
+        for _ in 0..2 {
+            if let Some(next) = fx.params.get(image) {
+                image = next;
+            }
+        }
+        match doc.images.get(image) {
+            Some(uri) => {
+                let file = file_reference(uri);
+                let path = references.resolve(base, &file);
+                m.texture = Some(path.with_context(|| format!("Texture {}", safe(&file)))?);
+                m.kd = [1.; 3];
+            }
+            None => warnings.missing.add(texture),
+        }
+    }
+    Ok(Some(m))
 }
 /// A `<node>`, under the one at the top of `stack`.
 fn start_node(doc: &mut Document, e: &BytesStart, stack: &mut Vec<usize>) -> Res<()> {
@@ -658,19 +905,20 @@ impl Attribute {
 }
 struct Warnings {
     unsupported: Tally,
+    missing: Tally,
     inputs: Tally,
     unbound: Tally,
     bindings: Tally,
     short_faces: u64,
 }
 pub fn spool(input: &Path, dir: &Path, progress: bool, references: &References) -> Res<Scene> {
-    let _ = references;
     let file = File::open(input).with_context(|| shown(input))?;
     // SAFETY: the input is only read. Another process truncating it during the import would
     // raise SIGBUS, as a full disk does on the workspace's sparse maps.
     let map = unsafe { Mmap::map(&file)? };
     let mut warnings = Warnings {
         unsupported: Tally::new("unsupported COLLADA content omitted"),
+        missing: Tally::new("missing COLLADA materials or images, using the default"),
         inputs: Tally::new("unsupported COLLADA inputs omitted"),
         unbound: Tally::new("COLLADA material symbols without a binding, using the default"),
         bindings: Tally::new(
@@ -686,7 +934,9 @@ pub fn spool(input: &Path, dir: &Path, progress: bool, references: &References) 
             doc.nodes.len()
         );
     }
-    let scene = decode(&doc, &map, dir, &mut warnings).with_context(|| shown(input))?;
+    let base = input.parent().unwrap_or(Path::new("."));
+    let scene =
+        decode(&doc, &map, dir, base, references, &mut warnings).with_context(|| shown(input))?;
     if warnings.short_faces > 0 {
         crate::say!(
             "Warning: omitted {} faces with fewer than three corners",
@@ -696,7 +946,14 @@ pub fn spool(input: &Path, dir: &Path, progress: bool, references: &References) 
     Ok(scene)
 }
 /// The second pass: the node tree, then each instanced geometry, in file order.
-fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Res<Scene> {
+fn decode(
+    doc: &Document,
+    map: &[u8],
+    dir: &Path,
+    base: &Path,
+    references: &References,
+    warnings: &mut Warnings,
+) -> Res<Scene> {
     let scene_id = doc
         .scene
         .as_ref()
@@ -807,7 +1064,8 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
         zero_normals: false,
         bases: HashMap::new(),
     };
-    let materials = vec![Material::new("default")];
+    let mut materials = vec![Material::new("default")];
+    let mut material_ids: HashMap<&str, u32> = HashMap::new();
     let mut bbox = BBox::new();
     let mut bounds = vec![BBox::new(); objects.len()];
     let mut missing_normals = false;
@@ -816,12 +1074,36 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
         let geometry = &doc.geometries[g];
         let mut local = BBox::new();
         for primitive in &geometry.primitives {
-            if let Some(symbol) = &primitive.material {
-                if !bindings[&g].iter().any(|(s, _)| s == symbol) {
+            // The symbol's binding, or a material of that id, as exporters without bindings
+            // write it.
+            let target = primitive.material.as_deref().and_then(|symbol| {
+                let bound = bindings[&g].iter().find(|(s, _)| s == symbol);
+                let target = bound.map(|(_, t)| t.as_str()).or_else(|| {
+                    let (id, _) = doc.materials.get_key_value(symbol)?;
+                    Some(id.as_str())
+                });
+                if target.is_none() {
                     warnings.unbound.add(symbol);
                 }
-            }
-            let material = 0;
+                target
+            });
+            let material = match target {
+                None => 0,
+                Some(id) => match material_ids.get(id) {
+                    Some(m) => *m,
+                    None => {
+                        let m = match build_material(doc, id, base, references, warnings)? {
+                            Some(m) => {
+                                materials.push(m);
+                                u32::try_from(materials.len() - 1)?
+                            }
+                            None => 0,
+                        };
+                        material_ids.insert(id, m);
+                        m
+                    }
+                },
+            };
             missing_normals |= decode_primitive(
                 doc,
                 map,

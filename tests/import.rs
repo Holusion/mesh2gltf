@@ -2072,3 +2072,148 @@ fn a_collada_node_instancing_itself_is_rejected() {
     assert_eq!(result.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("instances itself"), "{stderr}");
 }
+/// Effects as SketchUp, FreeCAD, Blender 2.7 and the FBX exporter write them.
+const EFFECTS: &str = r##"<library_images>
+    <image id="wood-image"><init_from>my%20maps/wood.png</init_from></image>
+  </library_images>
+  <library_effects>
+    <effect id="wood-fx"><profile_COMMON>
+      <newparam sid="wood-surface"><surface type="2D"><init_from>wood-image</init_from></surface></newparam>
+      <newparam sid="wood-sampler"><sampler2D><source>wood-surface</source></sampler2D></newparam>
+      <technique sid="COMMON"><lambert>
+        <diffuse><texture texture="wood-sampler" texcoord="UVSET0"/></diffuse>
+      </lambert></technique></profile_COMMON></effect>
+    <effect id="glass-fx"><profile_COMMON><technique sid="COMMON"><lambert>
+        <diffuse><color>0.2 0.4 0.6 1</color></diffuse>
+        <transparent opaque="RGB_ZERO"><color>0.48 0.48 0.48 1</color></transparent>
+        <transparency><float>1</float></transparency>
+      </lambert></technique></profile_COMMON></effect>
+    <effect id="part-fx"><profile_COMMON><technique sid="common"><phong>
+        <diffuse><color>0.8 0.8 1.0 1.0</color></diffuse>
+        <specular><color>1 1 1 1.0</color></specular>
+        <shininess><float>0.0</float></shininess>
+        <reflectivity><float>1.0</float></reflectivity>
+        <transparent><color>0.0 0.0 0.0 1.0</color></transparent>
+        <transparency><float>1.0</float></transparency>
+      </phong></technique>
+      <extra><technique profile="GOOGLEEARTH"><double_sided>1</double_sided></technique></extra>
+    </profile_COMMON></effect>
+    <effect id="gem-fx"><profile_COMMON><technique sid="common"><phong>
+        <diffuse><color>1 1 1 1</color></diffuse>
+        <specular><color>0 0 0 1</color></specular>
+        <transparency><float>0.055</float></transparency>
+      </phong></technique></profile_COMMON></effect>
+    <effect id="logo-fx"><profile_COMMON><technique sid="standard"><constant>
+        <emission><color>0.5 0.5 0.5 1</color></emission>
+      </constant></technique></profile_COMMON></effect>
+  </library_effects>
+  <library_materials>
+    <material id="wood" name="Wood"><instance_effect url="#wood-fx"/></material>
+    <material id="glass" name="Glass"><instance_effect url="#glass-fx"/></material>
+    <material id="part" name="Part"><instance_effect url="#part-fx"/></material>
+    <material id="gem" name="Gem"><instance_effect url="#gem-fx"/></material>
+    <material id="logo" name="Logo"><instance_effect url="#logo-fx"/></material>
+  </library_materials>"##;
+/// One node per material, each binding the quad's symbol to it, the last without a binding.
+fn material_nodes() -> String {
+    let mut nodes = String::new();
+    for m in ["wood", "glass", "part", "gem"] {
+        nodes += &format!(
+            r##"<node name="{m}"><instance_geometry url="#{m}-quad"><bind_material><technique_common>
+            <instance_material symbol="paint" target="#{m}"/></technique_common></bind_material>
+            </instance_geometry></node>"##
+        );
+    }
+    // FBX writes the material's id where a symbol belongs, and binds nothing.
+    nodes + r##"<node name="logo"><instance_geometry url="#logo-quad"/></node>"##
+}
+fn material_geometries() -> String {
+    let mut out = String::new();
+    for m in ["wood", "glass", "part", "gem", "logo"] {
+        let symbol = if m == "logo" { "logo" } else { "paint" };
+        out += &SQUARE
+            .split("<geometry id=\"tris\"")
+            .next()
+            .unwrap()
+            .replace("<library_geometries>", "")
+            .replace("quad", &format!("{m}-quad"))
+            .replace(
+                r#"<polylist count="1">"#,
+                &format!(r#"<polylist count="1" material="{symbol}">"#),
+            );
+    }
+    format!("<library_geometries>{out}</library_geometries>")
+}
+#[test]
+fn collada_effects_become_materials() {
+    let f = Fixture::new();
+    fs::create_dir(f.0.join("my maps")).unwrap();
+    image::RgbImage::from_pixel(2, 2, image::Rgb([200, 100, 50]))
+        .save(f.0.join("my maps/wood.png"))
+        .unwrap();
+    f.file(
+        "in.dae",
+        &dae(
+            "",
+            &format!("{EFFECTS}{}", material_geometries()),
+            &material_nodes(),
+        ),
+    );
+    let result = f.import("in.dae", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, _) = f.result();
+    let materials: std::collections::HashMap<_, _> = root["materials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["name"].as_str().unwrap().to_owned(), m.clone()))
+        .collect();
+    let pbr = |name: &str| &materials[name]["pbrMetallicRoughness"];
+    // The texture replaces the diffuse colour.
+    assert_eq!(pbr("Wood")["baseColorFactor"], json!([1., 1., 1., 1.]));
+    assert!(pbr("Wood").get("baseColorTexture").is_some());
+    assert_eq!(
+        root["images"][0]["uri"].as_str().unwrap(),
+        "my%20maps/wood.png"
+    );
+    // RGB_ZERO grey glass: 1 − 0.48 opaque.
+    let alpha = pbr("Glass")["baseColorFactor"][3].as_f64().unwrap();
+    assert!((alpha - 0.52).abs() < 1e-6, "{alpha}");
+    assert_eq!(materials["Glass"]["alphaMode"], "BLEND");
+    // FreeCAD's defaults: opaque, matte, no metal, double-sided from the GOOGLEEARTH extra.
+    assert_eq!(materials["Part"]["alphaMode"], "OPAQUE");
+    assert_eq!(pbr("Part")["roughnessFactor"], 1.);
+    assert_eq!(pbr("Part")["metallicFactor"], 0.);
+    assert_eq!(materials["Part"]["doubleSided"], true);
+    // No transparent colour: the transparency is the alpha, as Blender and three.js read it.
+    let alpha = pbr("Gem")["baseColorFactor"][3].as_f64().unwrap();
+    assert!((alpha - 0.055).abs() < 1e-9, "{alpha}");
+    assert_eq!(
+        materials["Gem"]["extensions"]["KHR_materials_specular"]["specularFactor"],
+        0.
+    );
+    // constant is unlit; found by its id, without a binding.
+    assert!(materials["Logo"]["extensions"]
+        .get("KHR_materials_unlit")
+        .is_some());
+}
+#[test]
+fn a_missing_collada_texture_fails_the_conversion() {
+    let f = Fixture::new();
+    f.file(
+        "in.dae",
+        &dae(
+            "",
+            &format!("{EFFECTS}{}", material_geometries()),
+            &material_nodes(),
+        ),
+    );
+    let result = f.import("in.dae", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("wood.png"), "{stderr}");
+}
