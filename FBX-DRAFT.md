@@ -124,3 +124,183 @@ to the workspace and then goes through `images.rs` as usual); skinned meshes in 
 with a counted warning: animation, blend shapes, NURBS and curves, cameras, lights, extra UV sets.
 Per-corner vertex colors depend on the survey: COLLADA skips them, so FBX would bring them to
 the shared layer if they are common.
+
+## Results
+
+Night run of 2026-11-19, in the `fbx-support` worktree. Scripts, the `ufbx` checkout, builds and
+data are in its gitignored `out/`: `out/fbxsurvey` (survey reader and direct placement, Rust),
+`out/harness` (C harness), `out/scripts`, `out/data`.
+
+**Recommendation: A, our own `fbx.rs`.** B fails the memory check outright, and the identity
+check on FBX 6; and even where it would work, it saves about a third of our own code, under the
+40 % the rule asks for. Details below.
+
+### 1. Corpus survey
+
+766 paths; 762 FBX files read (58.7 GB). The other 4 are macOS `._` resource forks named `.fbx`.
+740 binary (FBX 6.1 to 7.7, mostly 7.4), 22 ASCII, 19 FBX 6. 11 files first failed in the survey
+reader on byte arrays (`c`), which an FBX SDK 2016 photogrammetry export writes; read after a fix.
+
+| Exporter | Files | GB | Largest |
+| --- | --- | --- | --- |
+| 3ds Max | 202 | 21.1 | 2.36 GB |
+| Blender | 188 | 3.9 | 427 MB |
+| FBX SDK (no application named) | 179 | 20.0 | 3.14 GB (ASCII) |
+| Maya | 104 | 1.8 | 90 MB |
+| Revit | 50 | 8.4 | 2.66 GB |
+| Scaniverse, Unreal, Cinema 4D, Houdini, Assimp, Modo | 39 | 3.5 | 662 MB |
+
+Feature usage, in files (of 762), with the main exporters:
+
+| Feature | Files | Mainly |
+| --- | --- | --- |
+| `PreRotation` | 247 | 3ds Max 192 |
+| Non-uniform scale | 140 | Blender, 3ds Max |
+| Negative scale | 90 | Revit, 3ds Max |
+| `GeometricTranslation` / `Rotation` / `Scaling` | 85 / 31 / 12 | 3ds Max |
+| `RotationPivot`, `ScalingPivot` | 68 | Maya 63 |
+| `PostRotation` | 22 | 3ds Max |
+| `RotationOrder` other than XYZ | 4 | |
+| `InheritType` other than RSrs (0 or 2) | 7 (858 models) | Blender, Maya |
+| Not Y up | 108 | Revit 50 (Z up, front −Y) |
+| Unusual axis systems | 13 | 9 photogrammetry files Z up, X front; 2 Y up, X front, −Z right; 1 Blender Z up, −X front, −Y right; 1 Z up, +Y front, −X right |
+| Unit not centimetres | 231 | m 61, ft 55, in 43, mm 37 |
+| Per-polygon materials (`ByPolygon`) | 374 | |
+| Normals `ByPolygonVertex` / `ByVertice` / `ByPolygon` | 644 / 89 / 50 | |
+| More than one UV set | 104 | |
+| Vertex colours | 48 | `ByPolygonVertex IndexToDirect` 24, `ByVertice` 21, `AllSame` 3 |
+| Polygons over 8 corners | 183 | Largest 4,836 corners; 3 files over mesh2gltf's 4,096 |
+| Geometry shared by several models | 63 (26,612 geometries) | Revit 49 |
+| …of which with other materials | 1 (282 instances) | Cinema 4D |
+| Embedded textures | 102 | |
+| Textures missing beside the file | 211 | |
+| Skins / blend shapes / animation | 37 / 12 / 92 | |
+| Coordinates over 10⁵ | 32 | 3ds Max |
+| ASCII / FBX 6 | 22 / 19 | |
+
+Across all models: `InheritType` 1 on 346,026, geometric transforms on 200,745, `PreRotation` on
+58,134, pivots on 511, `PostRotation` on 29.
+
+Decoded geometry per file: median 3 MB, p90 94 MB, p99 745 MB, largest 2.18 GB. The largest
+single array is 24 MB: big files are many objects, not one huge mesh. 45 % of arrays are
+compressed.
+
+### 2. Representative set
+
+31 files, in `out/data/representative.tsv`: the largest per exporter (11), the five largest
+overall, one per transform feature in use (post-rotation, rotation order, pivots, geometric
+rotation and scaling, negative scale), ASCII 7 and 6, binary FBX 6, embedded textures, three
+unusual axis systems, shared geometry with other materials, a skinned mesh, polygons over 4,096
+corners, and Revit's Z-up feet. Missed: a file with `InheritType` 0 or 2, which the picking script
+looked up under the wrong key.
+
+### 3. `ufbx` (v0.23.1, commit `26a482ae`)
+
+Peak RSS by `getrusage` and 0.1 s sampling, one run at a time. None reached the 75 % cap.
+
+| File | Size | Meshes | Full load | Geometry skipped | Skipped + `retain_dom` |
+| --- | --- | --- | --- | --- | --- |
+| FBX SDK F1 (ASCII) | 3.14 GB | 43,130 | 2.1 GB, 36 s | 435 MB | 798 MB |
+| Revit F2 | 2.66 GB | 174,050 | 6.7 GB, 29 s | 1.8 GB | **4.9 GB** |
+| 3ds Max F3 | 2.36 GB | 5,806 | 7.7 GB, 21 s | 44 MB | 130 MB |
+| 3ds Max F4 | 2.27 GB | 3,403 | 8.7 GB, 21 s | 48 MB | 128 MB |
+| FBX SDK F5 | 2.14 GB | 144,763 | 8.2 GB, 22 s | 3.8 GB | **8.3 GB** |
+| 3ds Max F6 | 1.96 GB | 6,423 | 5.3 GB | 42 MB | 125 MB |
+| F7 (negative scale) | 229 MB | 17,371 | 458 MB | 235 MB | 535 MB |
+| Others (24 files) | ≤ 662 MB | ≤ 12,090 | ≤ 1.1 GB | ≤ 167 MB | ≤ 455 MB |
+
+- **Full load (C):** 2 to 4 times the file, up to 8.7 GB. Out, as planned.
+- **Memory check for B: fails.** With geometry skipped, memory follows the object count, at 10–30 KB
+  per mesh, and `retain_dom`, which B needs for the ids, doubles it. Two files reach 4.9 and
+  8.3 GB, as much as a full load. "Low hundreds of MB" holds only for files with few objects.
+- **Identity check: 100 % on FBX 7, 0 % on FBX 6.** Every mesh's raw node carries its FBX id on
+  all 28 FBX 7 files; FBX 6 (binary and ASCII) identifies objects by name, so B would need a
+  second matching scheme there.
+- **Rust bindings:** `ufbx` 0.11.5 (MIT or Unlicense) bundles exactly ufbx 0.23.1 and compiles it
+  with `cc`. A probe loading with `ignore_geometry` and `retain_dom` builds clean with
+  `RUSTFLAGS='-D warnings'` and clippy `-D warnings` on Linux. It adds about 20 s of build time
+  (one 33,000-line C file) and about 475 KB to an LTO release binary. macOS and Windows weren't
+  built.
+
+### Placement
+
+Scene bounds in glTF axes and metres, as the largest per-axis difference relative to the scene's
+size. "Direct" is the survey tool's composition: Autodesk's order, rotation order, pre- and
+post-rotation, pivots and offsets, geometric transform, property templates, axes and unit, in
+208 lines (`out/fbxsurvey/src/place.rs`).
+
+- **Direct composition against `ufbx`:** equal within 6×10⁻⁵ on all 18 FBX 7 files it ran on,
+  including post-rotation, rotation order, pivots, geometric rotation and scaling, negative scale,
+  Revit's Z-up feet and the three unusual axis systems. Not run on the 9 files over 500 MB, or on
+  ASCII and FBX 6, which the prototype doesn't read.
+- **Blender 5.2 against `ufbx`:** equal on 5 files (3ds Max, Assimp, Blender, Maya, Modo), with
+  triangle counts within 0.03 %. Different on Cinema 4D's largest: 7.79 M triangles against 6.28 M,
+  and bounds 5.7 times the size apart; not investigated. Blender refuses ASCII FBX, so it can't
+  check the largest file. Blender's peak memory was 15 GB on the 2.36 GB 3ds Max file.
+- **Stopped:** Claude Code stopped the Blender runs, while Revit's 2.66 GB file was importing,
+  because the machine ran low on memory. The other 22 Blender comparisons weren't made, and the
+  run wasn't restarted, as Claude Code asked.
+
+### 4. Our own importer
+
+- **Decoding cost:** streaming zlib (flate2, miniz_oxide) decoded 15.0 GB of arrays in 122 s on one
+  thread: 123 MB/s. The corpus's largest file has 2.18 GB of arrays, about 18 s. `PolygonVertexIndex`
+  read in lockstep with its layers is the same pattern as COLLADA's `<vcount>` and `<p>`: no
+  measured obstacle.
+- **The transform stack is small**, at 208 lines in the prototype, and matches `ufbx` everywhere it
+  was compared. Its risk is in exporter quirks, not in the formula: `InheritType` 0 and 2, which
+  the prototype treats as 1, were not exercised.
+
+Lines of our own code, with the prototypes as measures (record reader 80 lines, ASCII tree 105,
+placement 208):
+
+| Part | A | B |
+| --- | --- | --- |
+| Binary record reader, array headers, 64-bit offsets | 120 | 120 |
+| ASCII reader, streaming (the largest file is ASCII) | 250 | 250 |
+| Index pass: objects, templates, properties, connections | 200 | — (ufbx) |
+| Transform stack, axes, unit | 210 | — (ufbx) |
+| Geometry: polygons, layers in lockstep, per-polygon materials, zlib | 300 | 300 |
+| Materials, textures, embedded content | 150 | — (ufbx) |
+| Skins in bind pose, blend shape base | 50 | — (ufbx) |
+| FBX 6: objects by name, geometry in models, `Properties60` | 120 | 60 (name matching) |
+| Glue from ufbx's scene to the scene layer, id matching | — | 250 |
+| Warnings and errors | 60 | 40 |
+| **Total** | **≈ 1,460** | **≈ 1,020**, plus a C dependency of 33,000 lines |
+
+B is about 30 % less of our own code.
+
+### 5. Decision rule
+
+| Row | Outcome | Holds? |
+| --- | --- | --- |
+| A if the pivot and pre/post-rotation transforms and unusual axes are rare, and A is ~1,000 lines | Not rare: `PreRotation` in 32 % of files, pivots in 9 %, not Y up in 14 %, 13 unusual axis systems; A is ~1,460 | No |
+| **A if B fails the memory or identity check** | Memory: 4.9 and 8.3 GB with ids. Identity: 0 % on FBX 6 | **Yes** |
+| B if it passes, the stack is widely used, and B saves ≥ ~40 % | B fails; and saves ~30 % | No |
+| A in between | | |
+
+**A.**
+
+Where the thresholds might move:
+
+- The memory check should come first and be absolute, as the project's constraint is: it decided
+  this on its own. "Low hundreds of MB" could be stated per object, for example under 2 KB per
+  object, which mesh2gltf's COLLADA first pass (4–5 KB per part) doesn't meet either.
+- Row 1's "~1,000 lines" undercounts FBX: an ASCII reader that streams is needed whatever the
+  choice, since the largest file is ASCII. About 1,500 is the honest figure for A.
+- "Transform stack widely used" was meant as a proxy for risk. The prototype shows the formula is
+  small and right; the risk is in exporters' quirks, which the corpus can test.
+
+### What the survey adds to the importer's scope
+
+- **ASCII must stream:** the largest file (3.1 GB) is ASCII, and Blender can't read it.
+- **Polygons over 4,096 corners:** 3 Maya files. mesh2gltf's face limit rejects them today.
+- **Missing textures:** 211 files would fail under the kept rule. Worth reconsidering for FBX,
+  where textures often stay on the author's machine and 102 files embed theirs anyway.
+- **Embedded textures:** 102 files. `images.rs` needs to take a texture written to the workspace.
+- **Per-corner vertex colours:** 24 files, which the per-position `vc` spool can't hold.
+- **Per-polygon materials** (374 files) fit the face spool as they are.
+- **Shared geometry with other materials:** one file. The scene layer's first-binding rule, with
+  its warning, is enough.
+- **Heap per object:** files with 145,000–174,000 objects will test the per-object records and
+  the glTF JSON writer, which already takes 417 MB for COLLADA's 27,000 parts.
