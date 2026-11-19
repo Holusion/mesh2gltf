@@ -1866,6 +1866,25 @@ fn zero_collada_normals_are_smoothed() {
     assert!(normals.iter().all(|n| n == &[0., 0., 1.]), "{normals:?}");
 }
 #[test]
+fn collada_normals_outside_their_source_are_generated() {
+    let f = Fixture::new();
+    let nodes = r##"<node name="A"><instance_geometry url="#tris"/></node>"##;
+    // The last corner's normal index is past the one normal, as the FBX exporter writes some.
+    let text = dae("", SQUARE, nodes).replace("2 0 3 0</p>", "2 0 3 5</p>");
+    f.file("in.dae", &text);
+    let result = f.import("in.dae", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("1 COLLADA normal or UV indices outside"),
+        "{stderr}"
+    );
+    let (root, bin) = f.result();
+    let normals = &root["meshes"][0]["primitives"][0]["attributes"]["NORMAL"];
+    let normals = floats(&root, &bin, normals.as_u64().unwrap() as usize, 3);
+    assert!(normals.iter().all(|n| n == &[0., 0., 1.]), "{normals:?}");
+}
+#[test]
 fn broken_collada_is_rejected() {
     let nodes = r##"<node name="A"><instance_geometry url="#tris"/></node>"##;
     let whole = dae("", SQUARE, nodes);

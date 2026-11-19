@@ -924,8 +924,27 @@ struct Spools {
     /// Where each source spooled so far starts, as the index before its first record, and how
     /// many records it has.
     bases: HashMap<(String, Role), (u64, u64)>,
+    /// The zero normal and the zero UV, written when first needed.
+    zeros: [Option<u64>; 3],
 }
 impl Spools {
+    fn zero(&mut self, role: Role) -> Res<u64> {
+        if let Some(index) = self.zeros[role as usize] {
+            return Ok(index);
+        }
+        let (out, width) = match role {
+            Role::Normal => (&mut self.vn, 3),
+            _ => (&mut self.vt, 2),
+        };
+        for _ in 0..width {
+            out.write_all(&0f64.to_le_bytes())?;
+        }
+        self.counts[role as usize] += 1;
+        self.zero_normals |= role == Role::Normal;
+        let index = self.counts[role as usize];
+        self.zeros[role as usize] = Some(index);
+        Ok(index)
+    }
     /// Spools `source` for `role` once, and returns its base and record count.
     fn source(
         &mut self,
@@ -1029,14 +1048,23 @@ struct Attribute {
     offset: usize,
     base: u64,
     count: u64,
+    role: Role,
 }
 impl Attribute {
-    fn index(&self, indices: &[u64]) -> Res<u64> {
+    /// The spool index of this attribute for a corner. A position outside its source is an
+    /// error, as the face would be misplaced. A normal or UV outside its source, which the FBX
+    /// exporter writes, only shades the corner wrong: it gets a zero record, which for a normal
+    /// means a generated smooth one, as three.js's ColladaLoader also loads such files.
+    fn index(&self, indices: &[u64], spools: &mut Spools, warnings: &mut Warnings) -> Res<u64> {
         let i = indices[self.offset];
-        if i >= self.count {
+        if i < self.count {
+            return Ok(self.base + i + 1);
+        }
+        if self.role == Role::Position {
             return Err(format!("COLLADA index {i} outside its source of {}", self.count).into());
         }
-        Ok(self.base + i + 1)
+        warnings.outside += 1;
+        spools.zero(self.role)
     }
 }
 struct Warnings {
@@ -1045,6 +1073,8 @@ struct Warnings {
     inputs: Tally,
     unbound: Tally,
     bindings: Tally,
+    /// Normal and UV indices outside their source.
+    outside: u64,
     short_faces: u64,
 }
 pub fn spool(input: &Path, dir: &Path, progress: bool, references: &References) -> Res<Scene> {
@@ -1061,6 +1091,7 @@ pub fn spool(input: &Path, dir: &Path, progress: bool, references: &References) 
             "COLLADA geometries instanced with another material binding, keeping the first",
         ),
         short_faces: 0,
+        outside: 0,
     };
     let doc = index(&map, &mut warnings.unsupported).with_context(|| shown(input))?;
     if progress {
@@ -1073,6 +1104,12 @@ pub fn spool(input: &Path, dir: &Path, progress: bool, references: &References) 
     let base = input.parent().unwrap_or(Path::new("."));
     let scene =
         decode(&doc, &map, dir, base, references, &mut warnings).with_context(|| shown(input))?;
+    if warnings.outside > 0 {
+        crate::say!(
+            "Warning: {} COLLADA normal or UV indices outside their source; those corners get a generated normal or a zero UV",
+            warnings.outside
+        );
+    }
     if warnings.short_faces > 0 {
         crate::say!(
             "Warning: omitted {} faces with fewer than three corners",
@@ -1198,6 +1235,7 @@ fn decode(
         counts: [0; 3],
         zero_normals: false,
         bases: HashMap::new(),
+        zeros: [None; 3],
     };
     let mut materials = vec![Material::new("default")];
     let mut material_ids: HashMap<&str, u32> = HashMap::new();
@@ -1345,6 +1383,7 @@ fn decode_primitive(
             offset,
             base,
             count,
+            role,
         })
     };
     let position = attribute(position, at, Role::Position)?;
@@ -1376,10 +1415,14 @@ fn decode_primitive(
             if corners.len() == MAX_FACE {
                 return Err(format!("Face exceeds {MAX_FACE} corners").into());
             }
+            let mut index = |a: Option<Attribute>| match a {
+                Some(a) => a.index(&indices, spools, warnings),
+                None => Ok(0),
+            };
             corners.push(Corner {
-                v: position.index(&indices)?,
-                vt: uv.map(|a| a.index(&indices)).transpose()?.unwrap_or(0),
-                vn: normal.map(|a| a.index(&indices)).transpose()?.unwrap_or(0),
+                v: index(Some(position))?,
+                vt: index(uv)?,
+                vn: index(normal)?,
             });
         }
         if corners.len() < 3 {
