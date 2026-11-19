@@ -1867,3 +1867,130 @@ fn broken_collada_is_rejected() {
         assert!(!f.0.join("out.gltf").exists(), "{case}");
     }
 }
+/// `a · b` for column-major 4×4 matrices given as JSON, absent meaning identity.
+fn compose(a: &[f64; 16], b: &Value) -> [f64; 16] {
+    let b: Vec<f64> = match b.as_array() {
+        Some(m) => m.iter().map(|v| v.as_f64().unwrap()).collect(),
+        None => vec![
+            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+        ],
+    };
+    std::array::from_fn(|i| (0..4).map(|k| a[k * 4 + i % 4] * b[(i / 4) * 4 + k]).sum())
+}
+/// Each mesh-holding node's world matrix, root first, by walking the scene.
+fn world_matrices(root: &Value) -> Vec<(usize, [f64; 16])> {
+    let mut out = Vec::new();
+    let identity = [
+        1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ];
+    let mut pending: Vec<(usize, [f64; 16])> = root["scenes"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| (n.as_u64().unwrap() as usize, identity))
+        .collect();
+    while let Some((n, parent)) = pending.pop() {
+        let node = &root["nodes"][n];
+        let world = compose(&parent, &node["matrix"]);
+        if let Some(mesh) = node["mesh"].as_u64() {
+            out.push((mesh as usize, world));
+        }
+        for c in node["children"].as_array().into_iter().flatten() {
+            pending.push((c.as_u64().unwrap() as usize, world));
+        }
+    }
+    out
+}
+fn apply(m: &[f64; 16], p: &[f32]) -> [f64; 3] {
+    std::array::from_fn(|r| (0..3).map(|k| m[k * 4 + r] * p[k] as f64).sum::<f64>() + m[12 + r])
+}
+/// Every vertex of `mesh` where the scene puts it.
+fn placed(root: &Value, bin: &[u8], mesh: usize) -> Vec<[f64; 3]> {
+    let mut out = Vec::new();
+    for (m, world) in world_matrices(root) {
+        if m != mesh {
+            continue;
+        }
+        for primitive in root["meshes"][m]["primitives"].as_array().unwrap() {
+            let position = primitive["attributes"]["POSITION"].as_u64().unwrap() as usize;
+            for p in floats(root, bin, position, 3) {
+                out.push(apply(&world, &p));
+            }
+        }
+    }
+    out
+}
+/// A 4 mm triangle in Lambert-93, where float32 resolves 0.5 m.
+const FAR: &str = r##"<library_geometries><geometry id="far" name="Far"><mesh>
+    <source id="far-p"><float_array id="far-p-a" count="9">651234.5678 6862001.234 120.5 651234.5718 6862001.234 120.5 651234.5678 6862001.238 120.5</float_array>
+      <technique_common><accessor source="#far-p-a" count="3" stride="3">
+        <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+      </accessor></technique_common></source>
+    <vertices id="far-v"><input semantic="POSITION" source="#far-p"/></vertices>
+    <triangles count="1"><input semantic="VERTEX" source="#far-v" offset="0"/><p>0 1 2</p></triangles>
+  </mesh></geometry></library_geometries>"##;
+fn close(a: [f64; 3], b: [f64; 3], tolerance: f64) -> bool {
+    (0..3).all(|i| (a[i] - b[i]).abs() <= tolerance)
+}
+#[test]
+fn collada_transforms_axes_and_units_place_the_geometry() {
+    let f = Fixture::new();
+    let nodes = r##"<node name="A"><translate>10 0 0</translate><rotate>0 0 1 90</rotate><scale>2 2 2</scale>
+        <instance_geometry url="#tris"/></node>"##;
+    let asset = r#"<unit name="inch" meter="0.0254"/><up_axis>Z_UP</up_axis>"#;
+    f.file("in.dae", &dae(asset, SQUARE, nodes));
+    let result = f.import("in.dae", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, bin) = f.result();
+    let vertices = placed(&root, &bin, 0);
+    // (1, 0, 0) is scaled to (2, 0, 0), turned to (0, 2, 0), moved to (10, 2, 0), then Z up to
+    // Y up, (x, z, −y), and inches to metres.
+    let expected = [10. * 0.0254, 0., -2. * 0.0254];
+    assert!(
+        vertices.iter().any(|v| close(*v, expected, 1e-9)),
+        "{vertices:?}"
+    );
+    assert_eq!(
+        root["extras"]["mesh2gltf"]["sourceBasis"]["metresPerUnit"],
+        0.0254
+    );
+}
+#[test]
+fn georeferenced_collada_keeps_its_digits_under_node_transforms() {
+    let f = Fixture::new();
+    let nodes = r##"<node name="A"><matrix>1 0 0 5 0 1 0 0 0 0 1 0 0 0 0 1</matrix>
+        <instance_geometry url="#far"/></node>"##;
+    f.file("in.dae", &dae("", FAR, nodes));
+    let result = f.import("in.dae", false);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (root, bin) = f.result();
+    let vertices = placed(&root, &bin, 0);
+    // Moved 5 along x by the node; float32 keeps the 4 mm triangle to well under a millimetre.
+    let corner = [651239.5718, 6862001.234, 120.5];
+    assert!(
+        vertices.iter().any(|v| close(*v, corner, 1e-4)),
+        "{vertices:?}"
+    );
+    assert_ne!(root["extras"]["mesh2gltf"]["origin"][0], "0");
+    // --center moves the scene's center, through the root, to 0.
+    let f = Fixture::new();
+    f.file("in.dae", &dae("", FAR, nodes));
+    assert!(f.import("in.dae", true).status.success());
+    let (root, bin) = f.result();
+    let vertices = placed(&root, &bin, 0);
+    let mid = |i: usize| {
+        let (lo, hi) = vertices.iter().fold((f64::MAX, f64::MIN), |(lo, hi), v| {
+            (lo.min(v[i]), hi.max(v[i]))
+        });
+        (lo + hi) / 2.
+    };
+    assert!((0..3).all(|i| mid(i).abs() < 1e-6), "{vertices:?}");
+}

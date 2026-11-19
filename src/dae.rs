@@ -16,7 +16,7 @@ use crate::{
     material::Material,
     obj::{encode_face, Corner, Scene, MAX_FACE},
     references::References,
-    scene::{Basis, Graph, Instance, Matrix, Node, IDENTITY},
+    scene::{multiply, Basis, Graph, Instance, Matrix, Node, IDENTITY},
     Res,
 };
 use memmap2::Mmap;
@@ -36,7 +36,7 @@ const MAX_TEXT: usize = 1024 * 1024;
 /// Bounds the node tree once `instance_node` references are expanded, which can multiply it.
 const MAX_NODES: usize = 1 << 22;
 /// Elements whose text is read whole, as opposed to the big arrays, which are only located.
-const SMALL_TEXT: &[&str] = &["matrix", "up_axis"];
+const SMALL_TEXT: &[&str] = &["matrix", "translate", "rotate", "scale", "up_axis"];
 
 /// `<accessor>`: how the records of a source sit in its array.
 struct Accessor {
@@ -76,9 +76,8 @@ struct Instanced {
 struct DaeNode {
     name: String,
     parent: Option<usize>,
+    /// The node's transforms, composed in document order: each applies before the ones above.
     matrix: Matrix,
-    /// Non-identity transforms, rejected until they are composed.
-    transformed: bool,
     geometries: Vec<Instanced>,
 }
 struct VisualScene {
@@ -174,6 +173,54 @@ fn floats(text: &str, n: usize, what: &str) -> Res<Vec<f64>> {
 fn row_major(text: &str) -> Res<Matrix> {
     let m = floats(text, 16, "matrix")?;
     Ok(std::array::from_fn(|i| m[(i % 4) * 4 + i / 4]))
+}
+/// A node transform element as a matrix: `<matrix>` is row-major, `<rotate>` an axis and an
+/// angle in degrees.
+fn transform_matrix(kind: &str, text: &str) -> Res<Matrix> {
+    let mut m = IDENTITY;
+    match kind {
+        "matrix" => m = row_major(text)?,
+        "translate" => m[12..15].copy_from_slice(&floats(text, 3, kind)?),
+        "scale" => {
+            let s = floats(text, 3, kind)?;
+            for i in 0..3 {
+                m[i * 5] = s[i];
+            }
+        }
+        _ => {
+            let r = floats(text, 4, kind)?;
+            let length = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            if r[3] == 0. {
+                return Ok(m);
+            }
+            if length == 0. {
+                return Err("COLLADA rotate has no axis".into());
+            }
+            let [x, y, z] = [r[0] / length, r[1] / length, r[2] / length];
+            let (sin, cos) = r[3].to_radians().sin_cos();
+            let t = 1. - cos;
+            // Rodrigues' rotation, by columns.
+            m = [
+                t * x * x + cos,
+                t * x * y + sin * z,
+                t * x * z - sin * y,
+                0.,
+                t * x * y - sin * z,
+                t * y * y + cos,
+                t * y * z + sin * x,
+                0.,
+                t * x * z + sin * y,
+                t * y * z - sin * x,
+                t * z * z + cos,
+                0.,
+                0.,
+                0.,
+                0.,
+                1.,
+            ];
+        }
+    }
+    Ok(m)
 }
 /// The first pass. Big arrays are located, not read.
 fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
@@ -313,7 +360,6 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                             name,
                             parent,
                             matrix: IDENTITY,
-                            transformed: false,
                             geometries: Vec::new(),
                         });
                     }
@@ -411,15 +457,18 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                         doc.geometries[geometry.unwrap()].primitives.push(p);
                     }
                     (Some("geometry"), "mesh") => geometry = None,
-                    (Some("node"), "matrix") if !node_stack.is_empty() => {
-                        let m = row_major(&text)?;
-                        let node = &mut doc.nodes[*node_stack.last().unwrap()];
-                        node.transformed |= m != IDENTITY;
-                    }
-                    (Some("node"), "translate" | "rotate" | "scale" | "lookat" | "skew")
+                    (Some("node"), transform @ ("matrix" | "translate" | "rotate" | "scale"))
                         if !node_stack.is_empty() =>
                     {
-                        doc.nodes[*node_stack.last().unwrap()].transformed = true;
+                        let m = transform_matrix(transform, &text)?;
+                        let node = &mut doc.nodes[*node_stack.last().unwrap()];
+                        node.matrix = multiply(&node.matrix, &m);
+                    }
+                    (Some("node"), transform @ ("lookat" | "skew")) if !node_stack.is_empty() => {
+                        // Ignoring it would misplace everything below the node.
+                        return Err(
+                            format!("COLLADA {transform} transforms are not supported").into()
+                        );
                     }
                     (Some("node"), "instance_geometry") => {
                         if let (Some(i), Some(&n)) = (instance.take(), node_stack.last()) {
@@ -643,9 +692,6 @@ fn decode(doc: &Document, map: &[u8], dir: &Path, warnings: &mut Warnings) -> Re
     }
     while let Some((n, parent)) = pending.pop() {
         let source = &doc.nodes[n];
-        if source.transformed {
-            return Err("COLLADA node transforms are not supported yet".into());
-        }
         let at = u32::try_from(nodes.len())?;
         nodes.push(Node {
             name: source.name.clone(),
