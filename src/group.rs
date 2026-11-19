@@ -44,7 +44,11 @@ pub fn key(scene: &Scene, colors: Option<&[u8]>, face: &Face) -> Res<(Key, bool)
     }
     let key = Key {
         object: face.object,
-        material: face.material,
+        material: scene
+            .aliases
+            .get(face.material)
+            .copied()
+            .unwrap_or(face.material),
         uv,
         colored: has_colors && !textured,
     };

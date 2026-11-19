@@ -1306,7 +1306,11 @@ fn thousands_of_unsupported_mtl_properties_are_one_warning() {
     let mut library = String::new();
     let mut obj = format!("mtllib m.mtl\n{}", TRIANGLE.replace("f 1 2 3\n", ""));
     for i in 0..20_000 {
-        library.push_str(&format!("newmtl {HOSTILE}{i}\nd 0\n{HOSTILE}{i} 1\n"));
+        // Each its own colour, so that none is merged with another.
+        let blue = i as f64 / 20_000.;
+        library.push_str(&format!(
+            "newmtl {HOSTILE}{i}\nKd 0 0 {blue}\nd 0\n{HOSTILE}{i} 1\n"
+        ));
         obj.push_str(&format!("usemtl {HOSTILE}{i}\nf 1 2 3\n"));
     }
     u.write("m.mtl", &library);

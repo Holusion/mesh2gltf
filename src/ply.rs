@@ -613,6 +613,7 @@ pub fn spool(
             if normals { vertex.count } else { 0 },
         ],
         graph: None,
+        aliases: Vec::new(),
     })
 }
 #[cfg(test)]

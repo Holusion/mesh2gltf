@@ -1218,6 +1218,7 @@ fn decode(
             }),
             bounds,
         }),
+        aliases: Vec::new(),
     })
 }
 /// Writes the faces of one primitive. Returns whether they lack normals.

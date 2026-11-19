@@ -127,6 +127,8 @@ fn convert(opts: &Options, ext: &str, references: References, workspace: &Path) 
             )?
         }
     };
+    let mut scene = scene;
+    scene.aliases = material::merge(&scene.materials);
     // Faces are checked before the slow work of converting textures and writing geometry.
     let groups = group::group(&scene, workspace, opts.progress)?;
     let images = images::prepare(

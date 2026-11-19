@@ -300,7 +300,11 @@ fn index_width_follows_vertex_count() {
 fn shuffled_faces_and_interleaved_materials_keep_exact_vertex_counts() {
     // A 40 x 40 grid of quads in a scrambled order, alternating two materials every quad.
     let f = Fixture::new();
-    f.file("in.mtl", "newmtl a\nnewmtl b\n");
+    // Distinct, so that they are not merged.
+    f.file(
+        "in.mtl",
+        "newmtl a\nKd 0.1 0.1 0.1\nnewmtl b\nKd 0.2 0.2 0.2\n",
+    );
     let mut file = fs::File::create(f.0.join("in.obj")).unwrap();
     writeln!(file, "mtllib in.mtl").unwrap();
     for y in 0..41 {
@@ -500,7 +504,10 @@ fn texture_error_cleans_previously_copied_files() {
 #[test]
 fn smooth_normals_cross_material_and_uv_seams() {
     let f = Fixture::new();
-    f.file("in.mtl", "newmtl first\nnewmtl second\n");
+    f.file(
+        "in.mtl",
+        "newmtl first\nKd 0.1 0.1 0.1\nnewmtl second\nKd 0.2 0.2 0.2\n",
+    );
     f.file("in.obj", "mtllib in.mtl\ns 1\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 2\nvt 0 0\nvt .5 .5\nusemtl first\nf 1/1 2/1 3/1\nusemtl second\nf 1/2 4/2 2/2\n");
     let result = f.import("in.obj", false);
     assert!(
@@ -1243,14 +1250,18 @@ fn vrml_colors_follow_the_same_rule() {
         .save(f.0.join("albedo.png"))
         .unwrap();
     let triangle = "coord Coordinate { point [0 0 0, 1 0 0, 0 1 0] } coordIndex [0 1 2 -1]";
-    let blue = "appearance Appearance { material Material { diffuseColor 0 0 1 } }";
+    // Each shape its own blue, so that their materials are not merged.
+    let blue = |i: u32| {
+        format!("appearance Appearance {{ material Material {{ diffuseColor 0 0 0.{i} }} }}")
+    };
+    let [b1, b2, b3, b4, b5] = [1, 2, 3, 4, 5].map(blue);
     let shapes = [
         // Colours before the coordinates they belong to.
-        format!("DEF before Shape {{ {blue} geometry IndexedFaceSet {{ color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} {triangle} }} }}"),
-        format!("DEF indexed Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} colorIndex [0 1 2 -1] color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
-        format!("DEF plain Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} }} }}"),
-        format!("DEF perface Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} colorPerVertex FALSE color Color {{ color [1 0 0] }} }} }}"),
-        format!("DEF reindexed Shape {{ {blue} geometry IndexedFaceSet {{ {triangle} colorIndex [2 1 0 -1] color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
+        format!("DEF before Shape {{ {b1} geometry IndexedFaceSet {{ color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} {triangle} }} }}"),
+        format!("DEF indexed Shape {{ {b2} geometry IndexedFaceSet {{ {triangle} colorIndex [0 1 2 -1] color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
+        format!("DEF plain Shape {{ {b3} geometry IndexedFaceSet {{ {triangle} }} }}"),
+        format!("DEF perface Shape {{ {b4} geometry IndexedFaceSet {{ {triangle} colorPerVertex FALSE color Color {{ color [1 0 0] }} }} }}"),
+        format!("DEF reindexed Shape {{ {b5} geometry IndexedFaceSet {{ {triangle} colorIndex [2 1 0 -1] color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
         format!("DEF textured Shape {{ appearance Appearance {{ texture ImageTexture {{ url \"albedo.png\" }} }} geometry IndexedFaceSet {{ {triangle} texCoord TextureCoordinate {{ point [0 0, 1 0, 0 1] }} color Color {{ color [1 0 0, 0 1 0, 0 0 1] }} }} }}"),
     ];
     f.file(
@@ -1303,7 +1314,9 @@ fn vrml_colors_follow_the_same_rule() {
         } else if name.starts_with("textured") {
             [0.8, 0.8, 0.8, 1.]
         } else {
-            [0., 0., 1., 1.]
+            let shapes = ["before", "indexed", "plain", "perface", "reindexed"];
+            let i = shapes.iter().position(|s| name.starts_with(s)).unwrap();
+            [0., 0., (i + 1) as f64 / 10., 1.]
         };
         assert_eq!(
             m["pbrMetallicRoughness"]["baseColorFactor"],
@@ -2258,4 +2271,24 @@ fn collada_skins_keep_their_bind_pose_and_morphs_their_base_shape() {
         morph.iter().any(|v| close(*v, [1., 6., 0.], 1e-9)),
         "{morph:?}"
     );
+}
+#[test]
+fn materials_equal_but_for_their_name_are_merged() {
+    let f = Fixture::new();
+    f.file("in.mtl", "newmtl first\nKd 0.5 0.5 0.5\nnewmtl second\nKd 0.5 0.5 0.5\nnewmtl other\nKd 0.1 0.2 0.3\n");
+    f.file("in.obj", "mtllib in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl first\nf 1 2 3\nusemtl second\nf 1 3 2\nusemtl other\nf 2 1 3\n");
+    let result = f.import("in.obj", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(stderr.contains("merged 1 materials"), "{stderr}");
+    let (root, _) = f.result();
+    let names: Vec<_> = root["materials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["first", "other"]);
+    // One primitive for the two faces of the merged materials.
+    assert_eq!(root["meshes"][0]["primitives"].as_array().unwrap().len(), 2);
 }

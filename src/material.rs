@@ -247,6 +247,29 @@ fn color(rest: &str) -> Res<[f64; 3]> {
         finite(v[2])?.clamp(0., 1.),
     ])
 }
+/// Each material's first equal in everything but its name, for its faces to use instead.
+/// Exporters that write one material per part, such as FreeCAD's, repeat a handful thousands of
+/// times. The first keeps its name, and the merge is reported in one line.
+pub fn merge(materials: &[Material]) -> Vec<usize> {
+    let mut first = HashMap::new();
+    let mut aliases = Vec::with_capacity(materials.len());
+    for (i, m) in materials.iter().enumerate() {
+        // `Debug` writes each float's shortest exact form, so equal text is equal values.
+        let key = format!(
+            "{:?}",
+            Material {
+                name: String::new(),
+                ..m.clone()
+            }
+        );
+        aliases.push(*first.entry(key).or_insert(i));
+    }
+    let merged = materials.len() - first.len();
+    if merged > 0 {
+        crate::say!("Note: merged {merged} materials equal to an earlier one");
+    }
+    aliases
+}
 /// Shared by all the libraries of a model, as a file can name any number of them.
 pub struct Warnings {
     properties: Tally,

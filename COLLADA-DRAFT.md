@@ -299,6 +299,13 @@ The material name then becomes the first source name, and the merge is reported 
 it can't meet those limits, materials stay one-to-one with the source, and that is recorded here.
 Measure on D8 first: if the 27,023 materials collapse to a handful, it is worth doing.
 
+**Done, within the limits:** `material::merge` (about 20 lines) gives each material the index of
+its first equal, compared by its `Debug` text without the name, and `group::key` reads faces'
+materials through it, so the face spool is not rewritten. Every importer goes through it, from
+`main.rs`. D8's 27,023 materials become 23, with no measurable change in time (62.6 s
+against 62.9 s) or peak memory. Four existing tests used materials equal but for their names to
+exercise grouping, and now give them distinct colours.
+
 ## Implementation order
 
 Each step ends with `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
