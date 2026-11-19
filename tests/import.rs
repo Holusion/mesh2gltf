@@ -2217,3 +2217,45 @@ fn a_missing_collada_texture_fails_the_conversion() {
     assert_eq!(result.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("wood.png"), "{stderr}");
 }
+const CONTROLLERS: &str = r##"<library_controllers>
+    <controller id="skin"><skin source="#tris">
+      <bind_shape_matrix>1 0 0 0 0 1 0 0 0 0 1 3 0 0 0 1</bind_shape_matrix>
+      <source id="skin-joints"><Name_array id="skin-joints-a" count="1">Bone</Name_array></source>
+      <vertex_weights count="4"><vcount>1 1 1 1</vcount><v>0 0 0 0 0 0 0 0</v></vertex_weights>
+    </skin></controller>
+    <controller id="morph"><morph source="#quad" method="NORMALIZED"/></controller>
+  </library_controllers>"##;
+#[test]
+fn collada_skins_keep_their_bind_pose_and_morphs_their_base_shape() {
+    let f = Fixture::new();
+    let nodes = r##"<node name="Holder"><translate>100 0 0</translate>
+          <instance_controller url="#skin"><skeleton>#bone</skeleton></instance_controller></node>
+        <node name="Morphed"><translate>0 5 0</translate><instance_controller url="#morph"/></node>
+        <node id="bone" name="Bone" type="JOINT"><translate>7 7 7</translate></node>"##;
+    f.file("in.dae", &dae("", &format!("{CONTROLLERS}{SQUARE}"), nodes));
+    let result = f.import("in.dae", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(stderr.contains("bind pose kept"), "{stderr}");
+    let (root, bin) = f.result();
+    let mesh = |name: &str| {
+        root["meshes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|m| m["name"] == name)
+            .unwrap()
+    };
+    // The skin sits at its bind shape, three up, whatever its holder's transform.
+    let skin = placed(&root, &bin, mesh("Tris"));
+    assert!(
+        skin.iter().any(|v| close(*v, [1., 1., 3.], 1e-9)),
+        "{skin:?}"
+    );
+    // The morph is its base shape under its node.
+    let morph = placed(&root, &bin, mesh("Quad"));
+    assert!(
+        morph.iter().any(|v| close(*v, [1., 6., 0.], 1e-9)),
+        "{morph:?}"
+    );
+}

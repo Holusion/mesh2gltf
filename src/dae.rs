@@ -47,6 +47,7 @@ const SMALL_TEXT: &[&str] = &[
     "init_from",
     "source",
     "double_sided",
+    "bind_shape_matrix",
 ];
 /// The `profile_COMMON` shading models, which hold one element per channel.
 const MODELS: &[&str] = &["constant", "lambert", "phong", "blinn"];
@@ -83,8 +84,16 @@ struct Geometry {
 }
 struct Instanced {
     url: String,
+    /// An `instance_controller`, whose url names a controller rather than a geometry.
+    controller: bool,
     /// `instance_material symbol → target`.
     bindings: Vec<(String, String)>,
+}
+/// A `<skin>` or `<morph>`: the shape it deforms, a geometry or another controller.
+struct Controller {
+    source: String,
+    /// A skin's `bind_shape_matrix`; `None` for a morph.
+    bind_shape: Option<Matrix>,
 }
 struct DaeNode {
     name: String,
@@ -134,6 +143,7 @@ struct Document {
     effects: HashMap<String, Effect>,
     /// Image id → the URI of its file.
     images: HashMap<String, String>,
+    controllers: HashMap<String, Controller>,
 }
 /// `#id` → `id`. A reference to another document can't be followed.
 fn local(url: &str) -> Res<&str> {
@@ -281,6 +291,7 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
     let mut effect: Option<String> = None;
     let mut param: Option<String> = None;
     let mut image: Option<String> = None;
+    let mut controller: Option<String> = None;
     let position = |reader: &Reader<&[u8]>| reader.buffer_position() as usize;
     loop {
         let event = reader.read_event().map_err(|e| {
@@ -402,11 +413,24 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                         let url = local(&attribute(&e, "url")?.unwrap_or_default())?.to_owned();
                         doc.nodes[*node_stack.last().unwrap()].instances.push(url);
                     }
-                    (Some("node"), "instance_geometry") if !node_stack.is_empty() => {
+                    (Some("node"), kind @ ("instance_geometry" | "instance_controller"))
+                        if !node_stack.is_empty() =>
+                    {
                         instance = Some(Instanced {
                             url: local(&attribute(&e, "url")?.unwrap_or_default())?.into(),
+                            controller: kind == "instance_controller",
                             bindings: Vec::new(),
                         });
+                    }
+                    (Some("library_controllers"), "controller") => {
+                        controller = attribute(&e, "id")?;
+                    }
+                    (Some("controller"), kind @ ("skin" | "morph")) if controller.is_some() => {
+                        let source = local(&attribute(&e, "source")?.unwrap_or_default())?.into();
+                        let bind_shape = (kind == "skin").then_some(IDENTITY);
+                        let id = controller.clone().unwrap();
+                        doc.controllers
+                            .insert(id, Controller { source, bind_shape });
                     }
                     (Some("technique_common"), "instance_material") if instance.is_some() => {
                         let symbol = attribute(&e, "symbol")?.unwrap_or_default();
@@ -477,6 +501,7 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                                     | "library_materials"
                                     | "library_effects"
                                     | "library_images"
+                                    | "library_controllers"
                             ) =>
                     {
                         unsupported.add(library);
@@ -559,11 +584,18 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
                             format!("COLLADA {transform} transforms are not supported").into()
                         );
                     }
-                    (Some("node"), "instance_geometry") => {
+                    (Some("node"), "instance_geometry" | "instance_controller") => {
                         if let (Some(i), Some(&n)) = (instance.take(), node_stack.last()) {
                             doc.nodes[n].geometries.push(i);
                         }
                     }
+                    (Some("skin"), "bind_shape_matrix") if controller.is_some() => {
+                        let id = controller.as_ref().unwrap();
+                        if let Some(c) = doc.controllers.get_mut(id) {
+                            c.bind_shape = Some(row_major(&text)?);
+                        }
+                    }
+                    (Some("library_controllers"), "controller") => controller = None,
                     (_, "node") if visual_scene.is_some() || in_library => {
                         node_stack.pop();
                     }
@@ -623,6 +655,37 @@ fn index(map: &[u8], unsupported: &mut Tally) -> Res<Document> {
         return Err("COLLADA document ends before its last element closes".into());
     }
     Ok(doc)
+}
+/// The geometry an instance shows, and for a skin, its bind shape matrix. A controller names a
+/// geometry or another controller: a morph's base shape is shown, without its targets, and a
+/// skin's bind pose, without its joints.
+fn resolve_instance(
+    doc: &Document,
+    instance: &Instanced,
+    warnings: &mut Warnings,
+) -> Res<(usize, Option<Matrix>)> {
+    let mut url = instance.url.as_str();
+    let mut bind_shape = None;
+    if instance.controller {
+        // Bounded: a controller can only name a few others before naming a geometry.
+        for _ in 0..8 {
+            let Some(c) = doc.controllers.get(url) else {
+                break;
+            };
+            warnings.unsupported.add(if c.bind_shape.is_some() {
+                "skin joints and weights (bind pose kept)"
+            } else {
+                "morph targets (base shape kept)"
+            });
+            bind_shape = bind_shape.or(c.bind_shape);
+            url = &c.source;
+        }
+    }
+    let geometry = doc
+        .geometry_ids
+        .get(url)
+        .ok_or_else(|| format!("COLLADA geometry {} is missing", safe(url)))?;
+    Ok((*geometry, bind_shape))
 }
 /// Whether the top of `stack` is a channel of a `profile_COMMON` shading model.
 fn in_model(stack: &[String]) -> bool {
@@ -965,7 +1028,8 @@ fn decode(
         .ok_or_else(|| format!("COLLADA visual scene {} is missing", safe(scene_id)))?;
     // Each node, and the geometry each instance names, with the first binding of each.
     let mut nodes: Vec<Node> = Vec::new();
-    let mut instanced: Vec<Option<usize>> = Vec::new();
+    // The geometry each node instances, and the instance's geometry matrix.
+    let mut instanced: Vec<Option<(usize, Matrix)>> = Vec::new();
     let mut bindings: HashMap<usize, &[(String, String)]> = HashMap::new();
     // A node to place, its parent in the output, and the `instance_node` targets being expanded
     // around it, as a link in `chains`, to catch a node that instances itself.
@@ -995,26 +1059,36 @@ fn decode(
             mesh: None,
         });
         instanced.push(None);
-        for (k, g) in source.geometries.iter().enumerate() {
-            let geometry = *doc
-                .geometry_ids
-                .get(&g.url)
-                .ok_or_else(|| format!("COLLADA geometry {} is missing", safe(&g.url)))?;
+        let mut first_mesh = true;
+        for g in &source.geometries {
+            let (geometry, bind_shape) = resolve_instance(doc, g, warnings)?;
             let first = bindings.entry(geometry).or_insert(&g.bindings);
             if *first != g.bindings.as_slice() {
                 warnings.bindings.add(&doc.geometries[geometry].name);
             }
-            // A node's first instance is the node's mesh, and the others are child nodes.
-            if k > 0 {
+            if let Some(bind_shape) = bind_shape {
+                // A skin's joints place it, not the node holding it: in its bind pose it sits
+                // at the bind shape matrix in the scene's space, as COLLADA's skinning defines.
+                nodes.push(Node {
+                    name: source.name.clone(),
+                    parent: None,
+                    matrix: IDENTITY,
+                    mesh: None,
+                });
+                instanced.push(Some((geometry, bind_shape)));
+            } else if first_mesh {
+                // A node's first instance is the node's mesh, and the others are child nodes.
+                first_mesh = false;
+                instanced[at as usize] = Some((geometry, IDENTITY));
+            } else {
                 nodes.push(Node {
                     name: doc.geometries[geometry].name.clone(),
                     parent: Some(at),
                     matrix: IDENTITY,
                     mesh: None,
                 });
-                instanced.push(None);
+                instanced.push(Some((geometry, IDENTITY)));
             }
-            *instanced.last_mut().unwrap() = Some(geometry);
             if nodes.len() > MAX_NODES {
                 return Err("COLLADA scene has too many nodes".into());
             }
@@ -1048,10 +1122,10 @@ fn decode(
         objects.push(doc.geometries[g].name.clone());
     }
     for (node, geometry) in nodes.iter_mut().zip(&instanced) {
-        if let Some(g) = geometry {
+        if let Some((g, matrix)) = geometry {
             node.mesh = Some(Instance {
                 object: object_of[g],
-                geometry: IDENTITY,
+                geometry: *matrix,
             });
         }
     }
