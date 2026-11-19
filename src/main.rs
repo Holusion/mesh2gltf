@@ -2,6 +2,7 @@
 #![deny(clippy::print_stderr)]
 
 mod cli;
+mod dae;
 mod dedup;
 mod diagnostics;
 mod disk;
@@ -75,7 +76,7 @@ fn run(mut opts: Options) -> Res<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "obj" | "ply" | "wrl" | "vrml") {
+    if !matches!(ext.as_str(), "obj" | "ply" | "wrl" | "vrml" | "dae") {
         return Err(format!("Unsupported input format: .{}", diagnostics::safe(&ext)).into());
     }
     // Not `exists`, which follows a link and says no if it leads nowhere.
@@ -95,6 +96,7 @@ fn run(mut opts: Options) -> Res<()> {
 }
 fn convert(opts: &Options, ext: &str, references: References, workspace: &Path) -> Res<()> {
     let scene = match ext {
+        "dae" => dae::spool(&opts.input, workspace, opts.progress, &references)?,
         "ply" => ply::spool(
             &opts.input,
             workspace,

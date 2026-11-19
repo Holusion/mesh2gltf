@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     fs,
     io::Write,
@@ -128,14 +128,11 @@ fn georeferenced_model_keeps_its_place() {
     let extras = &root["extras"]["mesh2gltf"];
     assert_eq!(
         extras["origin"],
-        serde_json::json!(["651234.57", "6862001.236", "120.5"])
+        json!(["651234.57", "6862001.236", "120.5"])
     );
     assert_eq!(extras["centered"], false);
     for node in root["nodes"].as_array().unwrap() {
-        assert_eq!(
-            node["translation"],
-            serde_json::json!([651234.57, 6862001.236, 120.5])
-        );
+        assert_eq!(node["translation"], json!([651234.57, 6862001.236, 120.5]));
     }
     let primitive = &root["meshes"][0]["primitives"][0];
     let p = floats(
@@ -177,11 +174,11 @@ fn georeferenced_z_up_translation_is_in_output_axes() {
     let (root, _) = f.result();
     assert_eq!(
         root["extras"]["mesh2gltf"]["origin"],
-        serde_json::json!(["651010", "6862010", "120"])
+        json!(["651010", "6862010", "120"])
     );
     assert_eq!(
         root["nodes"][0]["translation"],
-        serde_json::json!([651010.0, 120.0, -6862010.0])
+        json!([651010.0, 120.0, -6862010.0])
     );
 }
 #[test]
@@ -195,7 +192,7 @@ fn local_model_has_no_translation() {
     let (root, _) = f.result();
     assert_eq!(
         root["extras"]["mesh2gltf"]["origin"],
-        serde_json::json!(["0", "0", "0"])
+        json!(["0", "0", "0"])
     );
     assert!(root["nodes"][0].get("translation").is_none());
 }
@@ -363,10 +360,7 @@ fn vrml_material_defaults_and_georeferencing() {
     assert_eq!(root["meshes"][0]["name"], "terrain");
     let p = &root["meshes"][0]["primitives"][0];
     let m = &root["materials"][p["material"].as_u64().unwrap() as usize];
-    assert_eq!(
-        m["extras"]["sourcePhong"]["Ks"],
-        serde_json::json!([0., 0., 0.])
-    );
+    assert_eq!(m["extras"]["sourcePhong"]["Ks"], json!([0., 0., 0.]));
     assert_eq!(m["extras"]["sourcePhong"]["Ns"], 25.6);
 }
 #[test]
@@ -904,10 +898,7 @@ fn faces_without_uvs_get_an_untextured_copy_of_their_material() {
     for p in primitives {
         let material = &root["materials"][p["material"].as_u64().unwrap() as usize];
         let pbr = &material["pbrMetallicRoughness"];
-        assert_eq!(
-            pbr["baseColorFactor"],
-            serde_json::json!([0.5, 0.25, 1., 1.])
-        );
+        assert_eq!(pbr["baseColorFactor"], json!([0.5, 0.25, 1., 1.]));
         if p["attributes"].get("TEXCOORD_0").is_some() {
             assert_eq!(material["name"], "paint");
             assert!(pbr.get("baseColorTexture").is_some());
@@ -981,7 +972,7 @@ fn map_kd_options_become_texture_transform_and_clamp() {
     assert_eq!(root["images"].as_array().unwrap().len(), 1);
     assert_eq!(
         root["samplers"],
-        serde_json::json!([{"wrapS":10497,"wrapT":10497},{"wrapS":33071,"wrapT":33071}])
+        json!([{"wrapS":10497,"wrapT":10497},{"wrapS":33071,"wrapT":33071}])
     );
     let info = |m: usize| &root["materials"][m]["pbrMetallicRoughness"]["baseColorTexture"];
     let sampler =
@@ -1005,10 +996,7 @@ fn map_kd_options_become_texture_transform_and_clamp() {
             .count(),
         1
     );
-    assert_eq!(
-        root["extensionsRequired"],
-        serde_json::json!(["KHR_texture_transform"])
-    );
+    assert_eq!(root["extensionsRequired"], json!(["KHR_texture_transform"]));
     // An option outside the spec's list leaves no way to find the path.
     let f = Fixture::new();
     f.file("in.mtl", "newmtl x\nmap_Kd -zoom 2 a.png\n");
@@ -1079,7 +1067,7 @@ fn keywords_match_whatever_their_case() {
     assert_eq!(material["name"], "Paint");
     assert_eq!(
         material["pbrMetallicRoughness"]["baseColorFactor"],
-        serde_json::json!([0.5, 0.25, 1., 0.5])
+        json!([0.5, 0.25, 1., 0.5])
     );
 }
 
@@ -1221,15 +1209,9 @@ fn vertex_colors_replace_the_diffuse_color_and_give_way_to_textures() {
         let pbr = &m["pbrMetallicRoughness"];
         let colored = m["name"].as_str().unwrap().ends_with("-vertex-colors");
         let rgb = if colored { 1. } else { 0.5 };
-        assert_eq!(
-            pbr["baseColorFactor"],
-            serde_json::json!([rgb, rgb, rgb, 1.])
-        );
+        assert_eq!(pbr["baseColorFactor"], json!([rgb, rgb, rgb, 1.]));
         assert_eq!(pbr.get("baseColorTexture").is_some(), m["name"] == "photo");
-        assert_eq!(
-            m["extras"]["sourcePhong"]["Kd"],
-            serde_json::json!([0.5, 0.5, 0.5])
-        );
+        assert_eq!(m["extras"]["sourcePhong"]["Kd"], json!([0.5, 0.5, 0.5]));
     }
     // --no-color drops them everywhere, and their warnings with them: materials keep `Kd`.
     let result = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
@@ -1430,7 +1412,9 @@ fn help_and_a_second_input() {
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         let help = String::from_utf8_lossy(&out.stdout);
         assert!(
-            help.starts_with("Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>"),
+            help.starts_with(
+                "Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml|file.dae>"
+            ),
             "{help}"
         );
     }
@@ -1688,7 +1672,7 @@ fn ply_georeferenced_doubles_keep_their_place() {
         let (root, bin) = f.result();
         assert_eq!(
             root["extras"]["mesh2gltf"]["origin"],
-            serde_json::json!(["651234.57", "6862001.236", "120.5"])
+            json!(["651234.57", "6862001.236", "120.5"])
         );
         let primitive = &root["meshes"][0]["primitives"][0];
         let p = floats(
@@ -1740,4 +1724,146 @@ fn ply_that_cannot_be_read_as_declared_is_rejected() {
         stderr.contains("Texture ../outside.png: not found, or outside"),
         "{stderr}"
     );
+}
+/// A COLLADA document with these libraries, and a visual scene of these nodes.
+fn dae(asset: &str, libraries: &str, nodes: &str) -> String {
+    format!(
+        r##"<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>{asset}</asset>
+  {libraries}
+  <library_visual_scenes><visual_scene id="Scene" name="Scene">{nodes}</visual_scene></library_visual_scenes>
+  <scene><instance_visual_scene url="#Scene"/></scene>
+</COLLADA>"##
+    )
+}
+/// A unit square: a quad and the same quad as two triangles, with per-corner UVs and normals.
+const SQUARE: &str = r##"<library_geometries>
+  <geometry id="quad" name="Quad"><mesh>
+    <source id="quad-p"><float_array id="quad-p-a" count="12">0 0 0 1 0 0 1 1 0 0 1 0</float_array>
+      <technique_common><accessor source="#quad-p-a" count="4" stride="3">
+        <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+      </accessor></technique_common></source>
+    <source id="quad-t"><float_array id="quad-t-a" count="8">0 0.25 1 0.25 1 1 0 1</float_array>
+      <technique_common><accessor source="#quad-t-a" count="4" stride="2">
+        <param name="S" type="float"/><param name="T" type="float"/>
+      </accessor></technique_common></source>
+    <vertices id="quad-v"><input semantic="POSITION" source="#quad-p"/></vertices>
+    <polylist count="1">
+      <input semantic="VERTEX" source="#quad-v" offset="0"/>
+      <input semantic="TEXCOORD" source="#quad-t" offset="1" set="0"/>
+      <vcount>4</vcount><p>0 0 1 1 2 2 3 3</p>
+    </polylist>
+  </mesh></geometry>
+  <geometry id="tris" name="Tris"><mesh>
+    <source id="tris-p"><float_array id="tris-p-a" count="12">0 0 0 1 0 0 1 1 0 0 1 0</float_array>
+      <technique_common><accessor source="#tris-p-a" count="4" stride="3">
+        <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+      </accessor></technique_common></source>
+    <source id="tris-n"><float_array id="tris-n-a" count="3">0 0 1</float_array>
+      <technique_common><accessor source="#tris-n-a" count="1" stride="3">
+        <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+      </accessor></technique_common></source>
+    <vertices id="tris-v"><input semantic="POSITION" source="#tris-p"/></vertices>
+    <triangles count="2">
+      <input semantic="VERTEX" source="#tris-v" offset="0"/>
+      <input semantic="NORMAL" source="#tris-n" offset="1"/>
+      <p>0 0 1 0 2 0 0 0 2 0 3 0</p>
+    </triangles>
+    <lines count="1"><input semantic="VERTEX" source="#tris-v" offset="0"/><p>0 1</p></lines>
+  </mesh></geometry>
+</library_geometries>"##;
+fn triangle_count(root: &Value, mesh: usize) -> u64 {
+    root["meshes"][mesh]["primitives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            root["accessors"][p["indices"].as_u64().unwrap() as usize]["count"]
+                .as_u64()
+                .unwrap()
+                / 3
+        })
+        .sum()
+}
+#[test]
+fn collada_triangles_and_polylists_convert_under_one_root() {
+    let f = Fixture::new();
+    let nodes = r##"<node id="a" name="A"><instance_geometry url="#quad"/></node>
+        <node id="b" name="B"><instance_geometry url="#tris"/>
+          <node id="c" name="C"><instance_geometry url="#quad"/></node></node>
+        <node id="cam" name="Camera"><instance_camera url="#camera"/></node>"##;
+    f.file("in.dae", &dae("", SQUARE, nodes));
+    let result = f.import("in.dae", false);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(stderr.contains("lines"), "{stderr}");
+    let (root, bin) = f.result();
+    assert_eq!(root["scenes"][0]["nodes"], json!([0]));
+    let nodes = root["nodes"].as_array().unwrap();
+    let names: Vec<_> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();
+    // The camera holds no mesh and is dropped; the quad's mesh is shared by A and C.
+    assert_eq!(names, ["Scene", "A", "B", "C"]);
+    assert_eq!(nodes[1]["mesh"], nodes[3]["mesh"]);
+    assert_eq!(nodes[2]["children"], json!([3]));
+    let quad = nodes[1]["mesh"].as_u64().unwrap() as usize;
+    let tris = nodes[2]["mesh"].as_u64().unwrap() as usize;
+    assert_eq!(
+        (triangle_count(&root, quad), triangle_count(&root, tris)),
+        (2, 2)
+    );
+    assert_eq!(root["meshes"][quad]["name"], "Quad");
+    let primitive = &root["meshes"][quad]["primitives"][0];
+    let uv = floats(
+        &root,
+        &bin,
+        primitive["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize,
+        2,
+    );
+    let positions = floats(
+        &root,
+        &bin,
+        primitive["attributes"]["POSITION"].as_u64().unwrap() as usize,
+        3,
+    );
+    // glTF's V runs down: the corner at the origin had (0, 0.25).
+    let origin = positions.iter().position(|p| p == &[0., 0., 0.]).unwrap();
+    assert_eq!(uv[origin], vec![0., 0.75]);
+    let normals = &root["meshes"][tris]["primitives"][0]["attributes"]["NORMAL"];
+    assert_eq!(
+        floats(&root, &bin, normals.as_u64().unwrap() as usize, 3)[0],
+        vec![0., 0., 1.]
+    );
+}
+#[test]
+fn broken_collada_is_rejected() {
+    let nodes = r##"<node name="A"><instance_geometry url="#tris"/></node>"##;
+    let whole = dae("", SQUARE, nodes);
+    let cases = [
+        ("truncated", whole[..whole.len() / 2].to_owned()),
+        ("overrun", whole.replace("2 0 3 0</p>", "2 0 3 0 1 0</p>")),
+        ("short", whole.replace("2 0 3 0</p>", "2 0</p>")),
+        ("index", whole.replace("2 0 3 0</p>", "2 0 4 0</p>")),
+        (
+            "dangling",
+            whole.replace(r##"url="#tris""##, r##"url="#nothing""##),
+        ),
+        (
+            "outside",
+            whole.replace(r##"url="#tris""##, r##"url="other.dae#tris""##),
+        ),
+        ("not xml", "COLLADA".to_owned()),
+    ];
+    for (case, text) in cases {
+        let f = Fixture::new();
+        f.file("in.dae", &text);
+        let result = f.import("in.dae", false);
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "{case}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!f.0.join("out.gltf").exists(), "{case}");
+    }
 }
