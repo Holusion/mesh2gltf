@@ -16,19 +16,20 @@ mesh2gltf model.obj
 mesh2gltf scan.ply
 mesh2gltf terrain.wrl --up-axis z -o terrain.gltf
 mesh2gltf building.obj --center
+mesh2gltf model.obj -o model.glb
 ```
 
-A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any copied or converted textures. By default, the output uses the input's name with a `.gltf` extension. The destination directory must already exist; existing output files are never overwritten. A failed conversion removes only output files it created.
+A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any copied or converted textures. An output ending in `.glb` is instead a single file holding the geometry and every texture, up to the 4 GiB a GLB can hold. By default, the output uses the input's name with a `.gltf` extension. The destination directory must already exist; existing output files are never overwritten. A failed conversion removes only output files it created.
 
 ```text
 mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
 
--o, --output FILE  Destination .gltf (default: input with .gltf extension)
+-o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)
     --center       Move the bounding-box center to 0, dropping the model's position
     --up-axis AXIS Source up axis: y (default) or z
     --tmp-dir DIR  Workspace directory (default: the output's directory)
     --keep-tmp     Preserve the workspace for debugging
-    --images MODE  auto (default), keep or copy
+    --images MODE  auto (default), keep or copy; a .glb embeds them
     --no-color     Ignore vertex colors, keeping the material color on untextured faces
     --trusted      Let the model refer to files outside its folder
     --progress     Report reading and conversion progress on stderr
@@ -39,7 +40,7 @@ Without arguments, mesh2gltf prints this help.
 
 Vertex colors (OBJ `v x y z r g b`, PLY `red green blue`, VRML `Color` nodes) are only written on faces without a texture, where they replace the material's diffuse color (`Kd` or `diffuseColor`). A texture replaces them, so they are dropped on textured faces. `--no-color` drops them everywhere, which keeps the material's own color.
 
-JPG and PNG textures are used as they are. Other formats, such as BMP, TIFF, TGA or EXR, are converted to PNG, which is lossless and keeps alpha. Textures stay in place when input and output share a folder and no conversion is needed; otherwise they are copied. Source images are never modified.
+JPG and PNG textures are used as they are. Other formats, such as BMP, TIFF, TGA or EXR, are converted to PNG, which is lossless and keeps alpha. Textures stay in place when input and output share a folder and no conversion is needed; otherwise they are copied. A `.glb` embeds them, so `--images keep` is a command-line error there. Source images are never modified.
 
 ## Models from other people
 
@@ -54,8 +55,8 @@ Messages on stderr can be shown to whoever supplied the model. A file is shown b
 | Code | Meaning |
 | ---- | ------- |
 | 0 | Success |
-| 1 | The input was rejected, including an input that isn't `.obj`, `.ply`, `.wrl` or `.vrml`, and a PLY without faces: point clouds aren't supported |
-| 2 | The command line is wrong, including `--images keep` with an output folder that doesn't hold the input's images |
+| 1 | The input was rejected, including an input that isn't `.obj`, `.ply`, `.wrl` or `.vrml`, a PLY without faces (point clouds aren't supported), and a model too large for a `.glb` |
+| 2 | The command line is wrong, including `--images keep` with a `.glb`, or with an output folder that doesn't hold the input's images |
 | 3 | A resource limit was reached: the disk is full, or a quota or file-size limit |
 | 4 | Another problem with the machine, such as permissions, a missing output directory or an output that already exists |
 | 101 | Internal error (a panic) |

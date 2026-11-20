@@ -53,6 +53,8 @@ fn main() -> ExitCode {
 pub struct Options {
     pub input: PathBuf,
     pub output: PathBuf,
+    /// One self-contained `.glb` rather than a `.gltf` beside its `.bin` and images.
+    pub glb: bool,
     pub tmp_dir: PathBuf,
     pub center: bool,
     pub z_up: bool,
@@ -66,6 +68,7 @@ pub struct Options {
 }
 fn run(mut opts: Options) -> Res<()> {
     opts.images.outside_references = opts.trusted;
+    opts.images.embed = opts.glb;
     let ext = opts
         .input
         .extension()
@@ -77,8 +80,8 @@ fn run(mut opts: Options) -> Res<()> {
     }
     // Not `exists`, which follows a link and says no if it leads nowhere.
     let taken = |path: &Path| fs::symlink_metadata(path).is_ok();
-    if taken(&opts.output) || taken(&opts.output.with_extension("bin")) {
-        let message = "Output .gltf or .bin already exists; choose a new output path";
+    if taken(&opts.output) || (!opts.glb && taken(&opts.output.with_extension("bin"))) {
+        let message = "Output .gltf, .glb or .bin already exists; choose a new output path";
         return Err(JobDirectory(io::Error::new(ErrorKind::AlreadyExists, message)).into());
     }
     // With `--tmp-dir` elsewhere, a missing output directory would only show after the import.
