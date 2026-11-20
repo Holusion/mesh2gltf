@@ -1,11 +1,16 @@
 # FBX (`.fbx`) import
 
-Working note for the `fbx-support` branch. Delete it before merging. The branch sits on
-`collada-support`'s implementation (`9f593ea`), whose scene layer (`src/scene.rs`,
-`COLLADA-DRAFT.md` "Shared scene layer") FBX uses.
+Working note for the `fbx-support` branch. Delete it before merging. The branch holds COLLADA's
+implementation (up to `e547a21`), whose scene layer (`src/scene.rs`, `COLLADA-DRAFT.md` "Shared
+scene layer") FBX uses, and goes to `main` as one merge once FBX is done.
 
 The evaluation below chose **A, our own `fbx.rs`**. "Plan for A", at the end, lists what's
 needed before the importer starts, the decisions left to you, and the implementation order.
+
+Samples are named by label, here and in `COLLADA-DRAFT.md`: D1–D22 for COLLADA (numbered as in
+its Samples table) and F1–F14 for FBX. The repository is public, so the labels' paths, and every
+other file and client name, stay out of it: they are in the worktree's gitignored
+`out/sample-key.md`, beside the survey data in `out/data`.
 
 ## Constraints the choice must respect
 
@@ -312,12 +317,16 @@ Where the thresholds might move:
 ### Before `fbx.rs`: shared work, in order
 
 Items 2 to 5 change code every importer uses, so each lands as its own commit ahead of FBX,
-with tests, and flat formats' output stays byte-identical.
+with tests. OBJ, PLY and VRML output stays byte-identical; COLLADA's may change.
 
-1. **Settle the base.** `fbx-support` sits on `collada-support`, which sits on `ply-support`;
-   neither is on `main`. COLLADA's open items (its README, AGENTS.md and wiki updates, and the
-   per-object origin in item 3) are best settled first, so FBX doesn't build on a layer that then
-   moves.
+1. **One merge for COLLADA and FBX.** PLY is on `main` (2026-11-20). COLLADA isn't merged on its
+   own: it goes to `main` together with FBX, from this branch. Until then nothing shared between
+   them is fixed: the scene layer, the scene path in `gltf.rs`, the material merge, and `dae.rs`
+   itself can be reworked as FBX needs, with COLLADA's tests and samples rerun rather than its
+   output kept stable. That covers applying item 3 and decisions 1 and 3 back to COLLADA, and a
+   two-pass reader shared by `dae.rs` and `fbx.rs`. The README, AGENTS.md and wiki updates are
+   written once, for both formats, in the last step. `collada-support` stays as a marker on the
+   COLLADA part of this branch; work goes on `fbx-support`.
 2. **Write the glTF JSON without building it whole.** `gltf.rs` builds the document as one
    `serde_json::Value`, about 13 KiB per mesh: 417 MiB on D8. FBX's two files with the
    most objects have 174,050 and 144,763 meshes, so about 2.2 and 1.8 GiB of heap for the JSON
@@ -327,8 +336,9 @@ with tests, and flat formats' output stays byte-identical.
 3. **Decide on one origin per object** (COLLADA open problem 1). 26 FBX files have positions over
    10⁵ in their own coordinates, up to 7.2 million, mostly 3ds Max. With one global origin,
    float32 keeps millimetres or worse there. The mesh child node already restores any origin, so
-   this changes the scene layer's decision, not its structure. Deciding it now avoids changing two
-   importers' output later.
+   this changes the scene layer's decision, not its structure. Since both formats merge together,
+   it may change COLLADA's output freely; deciding it before FBX's samples are validated saves
+   validating them twice.
 4. **Embedded textures in `images.rs`.** A texture mesh2gltf writes into the workspace is always
    copied, never kept by reference, since the workspace is removed. It is outside `references.rs`
    confinement because mesh2gltf wrote it, and its name, which comes from the file, is replaced by
@@ -416,7 +426,9 @@ One commit per step, each with tests and passing `fmt`, `clippy -D warnings` and
 8. Hardening in `tests/hostile.rs`: truncation at each record boundary, offsets past the end,
    wrong array lengths, deflate bombs, cyclic and dangling connections, deep nesting, 2²⁰ models.
 9. Samples, memory measurements, README, AGENTS.md's code layout, and the wiki's Conversion and
-   How it works pages.
+   How it works pages, for COLLADA and FBX together. COLLADA's samples are rerun on the final
+   build, since the shared code will have moved. Then both drafts are deleted and the branch
+   merges.
 
 ### Validation
 

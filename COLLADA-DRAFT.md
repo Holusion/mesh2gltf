@@ -1,12 +1,14 @@
 # COLLADA (`.dae`) import: draft
 
-Working note for the `collada-support` branch. Delete it before merging: the README and wiki
-take over once the behaviour exists.
+Working note, now on the `fbx-support` branch: COLLADA goes to `main` together with FBX, so
+shared code can still change for FBX (`FBX-DRAFT.md`, "Plan for A"). Delete it before merging:
+the README and wiki take over once the behaviour exists. Samples are labelled D1–D22, as in the
+Samples table; their paths are kept out of the repository (see `FBX-DRAFT.md`).
 
 ## Decisions
 
-FBX support is planned on the `fbx-support` branch (`FBX-DRAFT.md`). It shares this branch's
-scene layer, so the layer below is shaped for both formats.
+FBX support is planned in `FBX-DRAFT.md`, on the same branch. It shares the scene layer, so
+the layer below is shaped for both formats.
 
 1. XML is read with **`quick-xml` over a memory map of the input**.
 2. The COLLADA **node tree is kept** in the glTF; transforms aren't baked into positions.
@@ -24,7 +26,7 @@ scene layer, so the layer below is shaped for both formats.
 
 ## What the samples contain
 
-The survey covers the 22 paths in `collada.txt`. The four D13–16 are identical copies and
+The survey covers the 22 COLLADA paths on the shared drive. The four D13–16 are identical copies and
 D19 is a directory, so there are 18 distinct files, from 878 B to 2.8 GB.
 It was produced by a streaming scanner (`survey_dae.py`, kept outside the repository) that
 records tags, attributes and small texts and samples the first 3,000 numbers of each array.
@@ -334,16 +336,16 @@ Phase 1 of the night run, on 2026-11-19. Each step passes `cargo fmt --check`,
 
 | Step | Commit | State |
 | --- | --- | --- |
-| 1. Shared scene layer | `f14265d` | Done. `src/scene.rs`: `Node`, `Instance`, `Basis`, `Graph` as specified, written under one root. Flat formats byte-identical on real OBJ, PLY and VRML files |
-| 2. `dae.rs` index and decode passes | `c46903b`, fix `4896705` | Done. The fix: zero source normals now ask for smooth normals, as for OBJ; D8 and D11 panicked without it |
-| 3. Transforms, basis, mesh child nodes, `--center` | `9c5fde8` | Done. `matrix`, `translate`, `rotate`, `scale`; `lookat` and `skew` rejected. Mirrored basis tested in step 1 |
-| 4. `instance_node` | `365dd7a` | Done. D4: 52,622 glTF nodes sharing 23,031 meshes |
-| 5. Effects, images, binding | `453ce37` | Done, with the reference change recorded under "Materials": Blender 5.2 has no COLLADA importer |
-| 6. `instance_controller` | `83c2ada` | Done. Skins at their bind shape at the root, morphs as their base under their node |
-| 7. Material merge | `05e910e` | Done within the limits: about 30 lines, shared, no measurable cost |
+| 1. Shared scene layer | `8560d20` | Done. `src/scene.rs`: `Node`, `Instance`, `Basis`, `Graph` as specified, written under one root. Flat formats byte-identical on real OBJ, PLY and VRML files |
+| 2. `dae.rs` index and decode passes | `3245156`, fix `5b38499` | Done. The fix: zero source normals now ask for smooth normals, as for OBJ; D8 and D11 panicked without it |
+| 3. Transforms, basis, mesh child nodes, `--center` | `0994be8` | Done. `matrix`, `translate`, `rotate`, `scale`; `lookat` and `skew` rejected. Mirrored basis tested in step 1 |
+| 4. `instance_node` | `c12a3ee` | Done. D4: 52,622 glTF nodes sharing 23,031 meshes |
+| 5. Effects, images, binding | `1f6a365` | Done, with the reference change recorded under "Materials": Blender 5.2 has no COLLADA importer |
+| 6. `instance_controller` | `2d38762` | Done. Skins at their bind shape at the root, morphs as their base under their node |
+| 7. Material merge | `fa10ea1` | Done within the limits: about 30 lines, shared, no measurable cost |
 | 8. Samples, README, wiki | — | Samples run (below). README and wiki not touched, as the night run was told |
-| Hardening | `7192aaf` | Expansion counted before it is built, 2^20-node cap, 1 MiB attributes, 4096-deep nesting, entity decoding in short texts |
-| Repair | `b946f9c` | Normal and UV indices past their source get a zero record (D3's exporter bug), positions still rejected |
+| Hardening | `64de4db` | Expansion counted before it is built, 2^20-node cap, 1 MiB attributes, 4096-deep nesting, entity decoding in short texts |
+| Repair | `f339ceb` | Normal and UV indices past their source get a zero record (D3's exporter bug), positions still rejected |
 
 ### Samples
 
