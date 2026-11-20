@@ -17,6 +17,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
     let mut keep_tmp = false;
     let mut no_color = false;
     let mut trusted = false;
+    let mut exact_paths = false;
     let mut images = images::Options::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -54,6 +55,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
             "--keep-tmp" => keep_tmp = true,
             "--no-color" => no_color = true,
             "--trusted" => trusted = true,
+            "--exact-paths" => exact_paths = true,
             _ if arg.starts_with('-') => return Err(format!("Unknown option: {arg}").into()),
             _ if input.is_none() => input = Some(PathBuf::from(arg)),
             _ => return Err(format!("Unexpected argument: {arg}").into()),
@@ -86,8 +88,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
         images,
         no_color,
         trusted,
+        exact_paths,
     }))
 }
 fn help() {
-    println!("Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>\n\nImport OBJ, PLY or VRML IndexedFaceSet geometry into glTF 2.0: .gltf + external .bin, or one .glb.\n\n  -o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)\n      --center       Move the bounding-box center to 0, dropping the model's position\n      --up-axis AXIS Source up axis: y (default) or z; output is Y-up\n      --tmp-dir DIR  Disk-backed geometry spools (default: output directory)\n      --keep-tmp     Keep conversion workspace for debugging\n      --images MODE  auto (default), keep source references, or copy images; a .glb embeds them\n      --no-color     Ignore vertex colors, keeping the material color on untextured faces\n      --trusted      Let the model refer to files outside its folder\n      --progress     Report conversion progress on stderr\n  -h, --help         Show help");
+    println!("Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>\n\nImport OBJ, PLY or VRML IndexedFaceSet geometry into glTF 2.0: .gltf + external .bin, or one .glb.\n\n  -o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)\n      --center       Move the bounding-box center to 0, dropping the model's position\n      --up-axis AXIS Source up axis: y (default) or z; output is Y-up\n      --tmp-dir DIR  Disk-backed geometry spools (default: output directory)\n      --keep-tmp     Keep conversion workspace for debugging\n      --images MODE  auto (default), keep source references, or copy images; a .glb embeds them\n      --no-color     Ignore vertex colors, keeping the material color on untextured faces\n      --trusted      Let the model refer to files outside its folder\n      --exact-paths  Follow references only to their written path, never by name\n      --progress     Report conversion progress on stderr\n  -h, --help         Show help");
 }

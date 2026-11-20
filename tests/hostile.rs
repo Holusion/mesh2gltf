@@ -963,12 +963,35 @@ fn a_name_is_looked_for_beside_the_file_that_wrote_it() {
     u.assert_followed_and_contained("in.obj", "beside the library");
 }
 #[test]
-fn a_relative_path_is_not_looked_for_by_name() {
+fn a_relative_path_is_looked_for_by_name_inside_the_folder_only() {
     for (kind, secret) in KINDS {
+        // The folders the reference names are gone, and its file is beside the model.
         let u = Upload::new();
         write_own_copy(&u, secret, secret);
         let input = write_reference(&u, kind, &format!("sub/dir/{secret}"));
+        u.assert_followed_and_contained(input, &format!("{kind:?}"));
+        // Leaving the folder for the real file, only the model's own copy is read.
+        let u = Upload::new();
+        write_own_copy(&u, secret, secret);
+        let input = write_reference(&u, kind, &format!("../outside/{secret}"));
+        u.assert_followed_and_contained(input, &format!("{kind:?} leaving"));
+        for output in ["auto.bin", "keep.bin", "copy.bin"] {
+            let bytes = fs::read(u.job().join(output)).unwrap();
+            assert!(
+                !bytes.windows(CANARY.len()).any(|w| w == CANARY),
+                "{kind:?}"
+            );
+        }
+        // Without a copy, it is refused like any reference leading out.
+        let u = Upload::new();
+        let input = write_reference(&u, kind, &format!("../outside/{secret}"));
         u.assert_refused(input);
+        // `--exact-paths` only looks where the reference says.
+        let u = Upload::new();
+        write_own_copy(&u, secret, secret);
+        let input = write_reference(&u, kind, &format!("sub/dir/{secret}"));
+        let stderr = u.stderr_of(&[input, "-o", "out.gltf", "--exact-paths"]);
+        assert!(stderr.contains(REFUSED), "{kind:?}: {stderr}");
     }
 }
 #[test]

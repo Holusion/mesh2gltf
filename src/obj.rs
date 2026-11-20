@@ -4,7 +4,7 @@
 use crate::{
     diagnostics::{safe, shown, Tally},
     failure::Context,
-    references::References,
+    references::{References, Refused},
     Res,
 };
 use crate::{
@@ -336,7 +336,10 @@ pub fn spool(
                         )
                     };
                     // One file name with spaces in it, or several names.
-                    let whole = libraries.resolve(parent, rest).ok();
+                    let whole = match libraries.resolve(parent, rest) {
+                        Err(e) if !e.is::<Refused>() => return Err(e),
+                        whole => whole.ok(),
+                    };
                     if let Some(file) = whole.filter(|file| file.is_file()) {
                         load(&file)?;
                     } else {

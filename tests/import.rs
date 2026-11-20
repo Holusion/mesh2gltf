@@ -850,6 +850,65 @@ fn glb_refuses_images_keep_and_an_existing_file() {
     assert_eq!(fs::read(f.0.join("out.bin")).unwrap(), b"unrelated");
 }
 #[test]
+fn files_whose_folders_were_lost_are_found_by_name() {
+    // As an upload of loose files leaves them: every folder the references name is gone.
+    let f = textured_fixture("png");
+    f.file("in.mtl", "newmtl paint\nmap_Kd textures/source.png\n");
+    f.file(
+        "in.obj",
+        "mtllib materials/in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl paint\nf 1/1 2/1 3/1\n",
+    );
+    let result = import_images(&f, "out.gltf", &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Warning: references found by name beside the file that makes them, not at their written path: 2, for example materials/in.mtl, textures/source.png"),
+        "{stderr}"
+    );
+    assert_eq!(image_uri(&f, "out.gltf"), "source.png");
+    let result = import_images(&f, "exact.gltf", &["--exact-paths"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("mtllib materials/in.mtl: not found, or outside the model's folder"),
+        "{stderr}"
+    );
+    // Absolute paths too are only looked for where written.
+    f.file(
+        "in.mtl",
+        "newmtl paint\nmap_Kd C:\\Users\\bob\\source.png\n",
+    );
+    f.file(
+        "in.obj",
+        "mtllib in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl paint\nf 1/1 2/1 3/1\n",
+    );
+    let result = import_images(&f, "absolute.gltf", &[]);
+    assert!(result.status.success());
+    let result = import_images(&f, "exact.gltf", &["--exact-paths"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(!f.0.join("exact.gltf").exists());
+}
+#[test]
+fn textures_meeting_on_one_file_by_name_are_refused() {
+    let f = textured_fixture("png");
+    f.file(
+        "in.mtl",
+        "newmtl a\nmap_Kd a/source.png\nnewmtl b\nmap_Kd b/source.png\n",
+    );
+    f.file(
+        "in.obj",
+        "mtllib in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl a\nf 1/1 2/1 3/1\nusemtl b\nf 1/1 3/1 2/1\n",
+    );
+    let result = import_images(&f, "out.glb", &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Texture b/source.png: found only by name, as source.png, which a/source.png also leads to; the files can't be told apart"),
+        "{stderr}"
+    );
+    assert!(!f.0.join("out.glb").exists());
+}
+#[test]
 fn conversion_preserves_alpha() {
     let f = textured_fixture("tga");
     image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 0]))

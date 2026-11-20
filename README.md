@@ -32,6 +32,7 @@ mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
     --images MODE  auto (default), keep or copy; a .glb embeds them
     --no-color     Ignore vertex colors, keeping the material color on untextured faces
     --trusted      Let the model refer to files outside its folder
+    --exact-paths  Follow references only to their written path, never by name
     --progress     Report reading and conversion progress on stderr
 -h, --help         Show help
 ```
@@ -47,6 +48,8 @@ JPG and PNG textures are used as they are. Other formats, such as BMP, TIFF, TGA
 By default, mesh2gltf only follows a file reference in a model (an OBJ `mtllib`, an MTL `map_Kd`, a PLY `comment TextureFile`, a VRML `url`) to a regular file inside the input's folder. A model can't read anything else on the machine, and a reference that fails gets the same message whether the file is missing or forbidden. A texture that can't be reached fails the conversion, as a missing one does. The output doesn't refer outside its own folder either, so `--images keep` is a command-line error (exit 2) if it would.
 
 A reference may use `..` as long as it stays inside the folder. URLs and symlinks leading out are refused. An absolute path, which old exporters often write where a relative one belongs, is only used to look for a file of that name beside the file containing the reference. `--trusted` turns this off for a model you know: references may then point anywhere, including through symlinks, the lookup by name is only used when the absolute path doesn't exist, and `--images keep` may refer to any folder.
+
+A relative path that leads nowhere, often because an upload or archive lost the folders it names, is looked for by name beside the file containing the reference too, as obj2gltf does. `textures/wall.png` in an MTL finds `wall.png` next to that MTL when there's no `textures` folder. The lookup only checks that one folder for that one name, and the written path always wins when it exists. Files found by name are listed in one counted warning. Two references that mean different paths, such as `a/wall.png` and `b/wall.png`, or `old/wall.png` and `wall.png`, can't both lead to one file this way: which file each meant would be a guess, so the conversion fails. `--exact-paths` turns off every lookup by name, absolute and relative: a reference must then lead to a file exactly where written.
 
 Messages on stderr can be shown to whoever supplied the model. A file is shown by its name, never its folder, and a reference by what the model wrote. Names from a file are cut to a short length, and characters that could drive a terminal, read as markup or hide text are replaced by `?`. A problem a file repeats gives one warning, with its count and up to three examples, once the file has been read.
 
