@@ -53,6 +53,8 @@ fn main() -> ExitCode {
 pub struct Options {
     pub input: PathBuf,
     pub output: PathBuf,
+    /// One self-contained `.glb` rather than a `.gltf` beside its `.bin` and images.
+    pub glb: bool,
     pub tmp_dir: PathBuf,
     pub center: bool,
     pub z_up: bool,
@@ -63,9 +65,12 @@ pub struct Options {
     pub no_color: bool,
     /// Follow file references anywhere, rather than only inside the input's directory.
     pub trusted: bool,
+    /// Follow references only to their written path, never by name beside the referencing file.
+    pub exact_paths: bool,
 }
 fn run(mut opts: Options) -> Res<()> {
     opts.images.outside_references = opts.trusted;
+    opts.images.embed = opts.glb;
     let ext = opts
         .input
         .extension()
@@ -77,15 +82,15 @@ fn run(mut opts: Options) -> Res<()> {
     }
     // Not `exists`, which follows a link and says no if it leads nowhere.
     let taken = |path: &Path| fs::symlink_metadata(path).is_ok();
-    if taken(&opts.output) || taken(&opts.output.with_extension("bin")) {
-        let message = "Output .gltf or .bin already exists; choose a new output path";
+    if taken(&opts.output) || (!opts.glb && taken(&opts.output.with_extension("bin"))) {
+        let message = "Output .gltf, .glb or .bin already exists; choose a new output path";
         return Err(JobDirectory(io::Error::new(ErrorKind::AlreadyExists, message)).into());
     }
     // With `--tmp-dir` elsewhere, a missing output directory would only show after the import.
     fs::metadata(parent(&opts.output))
         .map_err(JobDirectory)
         .with_context(|| "Output directory".into())?;
-    let references = References::for_input(parent(&opts.input), opts.trusted)
+    let references = References::for_input(parent(&opts.input), opts.trusted, !opts.exact_paths)
         .with_context(|| "Input directory".into())?;
     let workspace = Workspace::create(&opts.tmp_dir, opts.keep_tmp)?;
     workspace.explain(convert(&opts, &ext, references, &workspace.path))
@@ -122,6 +127,8 @@ fn convert(opts: &Options, ext: &str, references: References, workspace: &Path) 
             )?
         }
     };
+    // Every reference has been followed: the files found by name are reported now.
+    drop(references);
     // Faces are checked before the slow work of converting textures and writing geometry.
     let groups = group::group(&scene, workspace, opts.progress)?;
     let images = images::prepare(

@@ -1,6 +1,6 @@
-//! The glTF file and its `.bin`. A geometry pass streams faces into the binary payload in
-//! primitives of bounded memory, whatever the size of an object; an appearance pass then
-//! describes their materials and textures.
+//! The glTF file and its `.bin`, or one GLB holding both and the images. A geometry pass
+//! streams faces into the binary payload in primitives of bounded memory, whatever the size of
+//! an object; an appearance pass then describes their materials and textures.
 use crate::{
     dedup::Dedup,
     diagnostics::{shown, Tally},
@@ -150,8 +150,8 @@ impl Document {
         Ok(())
     }
 }
-/// Writes `options.output` and its `.bin` from the spooled and grouped scene, placing textures
-/// as `images` plans them.
+/// Writes `options.output`, with its `.bin` unless it is a GLB, from the spooled and grouped
+/// scene, placing textures as `images` plans them.
 pub fn write(
     scene: Scene,
     groups: &[Group],
@@ -207,14 +207,21 @@ fn write_with_limit(
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
     let mut outputs = Outputs::default();
-    let look = appearance(
+    let (mut look, contents) = appearance(
         &scene,
         &mut document.meshes,
         &images,
         &transparent,
         parent(output),
         &mut outputs,
+        options.glb,
     )?;
+    let geometry_bytes = document.offset;
+    let embedded = if options.glb {
+        embed_images(&mut document, look.get_mut("images"), contents)?
+    } else {
+        Vec::new()
+    };
     // glTF applies the rotation first, so the translation is the origin in output axes. Parsed
     // from its decimal text, it is the `f64` a JSON reader gets from the origin.
     let translation = translated.then(|| {
@@ -244,26 +251,42 @@ fn write_with_limit(
     let mesh_count = meshes.len();
     let bin_path = output.with_extension("bin");
     let origin_strings = origin.map(format_fixed_as_decimal);
+    // A GLB's buffer is its binary chunk, which has no URI.
+    let mut buffer = json!({"byteLength":document.offset});
+    if !options.glb {
+        buffer["uri"] = json!(uri(&bin_path.file_name().unwrap().to_string_lossy()));
+    }
     let mut root = json!({"asset":{"version":"2.0","generator":concat!("mesh2gltf ",env!("CARGO_PKG_VERSION"))},
         "scene":0,"scenes":[{"nodes":(0..nodes.len()).collect::<Vec<_>>()}],"nodes":nodes,"meshes":meshes,
-        "buffers":[{"uri":uri(&bin_path.file_name().unwrap().to_string_lossy()),"byteLength":document.offset}],
-        "bufferViews":document.views,"accessors":document.accessors,
+        "buffers":[buffer],"bufferViews":document.views,"accessors":document.accessors,
         "extras":{"mesh2gltf":{"origin":origin_strings,"sourceBounds":scene.bbox.record(),"centered":center,"sourceUpAxis":if z_up {"z"} else {"y"},"coordinateConvention":COORDINATE_CONVENTION}}});
     root.as_object_mut().unwrap().extend(look);
-    let mut dst = BufWriter::new(outputs.create(&bin_path)?);
-    std::io::copy(&mut File::open(dir.join("payload.bin"))?, &mut dst)?;
-    dst.flush()?;
-    drop(dst);
-    let mut dst = BufWriter::new(outputs.create(output)?);
-    serde_json::to_writer_pretty(&mut dst, &root)?;
-    dst.flush()?;
-    drop(dst);
+    let payload = dir.join("payload.bin");
+    if options.glb {
+        write_glb(
+            output,
+            &root,
+            &payload,
+            &embedded,
+            document.offset,
+            &mut outputs,
+        )?;
+    } else {
+        let mut dst = BufWriter::new(outputs.create(&bin_path)?);
+        std::io::copy(&mut File::open(&payload)?, &mut dst)?;
+        dst.flush()?;
+        drop(dst);
+        let mut dst = BufWriter::new(outputs.create(output)?);
+        serde_json::to_writer_pretty(&mut dst, &root)?;
+        dst.flush()?;
+        drop(dst);
+    }
     outputs.commit();
     crate::say!(
         "Wrote {} ({} triangles, {mesh_count} meshes, {} bytes of geometry)",
         shown(output),
         document.triangles,
-        document.offset
+        geometry_bytes
     );
     Ok(())
 }
@@ -460,9 +483,80 @@ fn geometry(
     binary.flush()?;
     Ok(document)
 }
+/// An image placed in a GLB's binary chunk: its file, offset and length.
+type Embedded = (PathBuf, u64, u64);
+/// Places each image after the geometry, 4-byte aligned, in a buffer view of its own, and
+/// points the image at it. `contents` holds the image files in the order of `images`.
+fn embed_images(
+    document: &mut Document,
+    images: Option<&mut Value>,
+    contents: Vec<PathBuf>,
+) -> Res<Vec<Embedded>> {
+    let images = images.map_or(&mut [][..], |v| v.as_array_mut().unwrap());
+    let mut placed = Vec::new();
+    for (image, content) in images.iter_mut().zip(contents) {
+        let length = fs::metadata(&content)
+            .with_context(|| format!("Texture {}", shown(&content)))?
+            .len();
+        let offset = document.offset.next_multiple_of(4);
+        image["bufferView"] = json!(document.views.len());
+        document
+            .views
+            .push(json!({"buffer":0,"byteOffset":offset,"byteLength":length}));
+        document.offset = offset + length;
+        placed.push((content, offset, length));
+    }
+    Ok(placed)
+}
+/// Writes the GLB container (glTF 2.0, "GLB File Format Specification"): a 12-byte header, the
+/// JSON chunk padded with spaces, then the binary chunk, which is the geometry payload followed by
+/// the embedded images, padded with zeros. Every length is known before the first byte is
+/// written, so the file is written in one sequential pass and only the JSON is held in memory.
+fn write_glb(
+    path: &Path,
+    root: &Value,
+    payload: &Path,
+    images: &[Embedded],
+    buffer_length: u64,
+    outputs: &mut Outputs,
+) -> Res<()> {
+    let mut json = serde_json::to_vec(root)?;
+    json.resize(json.len().next_multiple_of(4), b' ');
+    let bin = buffer_length.next_multiple_of(4);
+    let total = 12 + 8 + json.len() as u64 + 8 + bin;
+    // GLB lengths are 32-bit; a .gltf's external .bin has no such limit.
+    let total = u32::try_from(total).map_err(|_| {
+        format!("The model needs {total} bytes, more than the 4 GiB a .glb can hold; write a .gltf instead")
+    })?;
+    let mut out = BufWriter::with_capacity(256 * 1024, outputs.create(path)?);
+    out.write_all(b"glTF")?;
+    out.write_all(&2u32.to_le_bytes())?;
+    out.write_all(&total.to_le_bytes())?;
+    out.write_all(&(json.len() as u32).to_le_bytes())?;
+    out.write_all(b"JSON")?;
+    out.write_all(&json)?;
+    out.write_all(&(bin as u32).to_le_bytes())?;
+    out.write_all(b"BIN\0")?;
+    let mut written = std::io::copy(&mut File::open(payload)?, &mut out)?;
+    for (content, offset, length) in images {
+        out.write_all(&[0; 4][..(offset - written) as usize])?;
+        let mut file =
+            File::open(content).with_context(|| format!("Texture {}", shown(content)))?;
+        // Its length is already in the JSON: had the file shrunk since, every later byte
+        // would shift.
+        if std::io::copy(&mut (&mut file).take(*length), &mut out)? != *length {
+            return Err(format!("Texture {} changed during the conversion", shown(content)).into());
+        }
+        written = offset + length;
+    }
+    out.write_all(&[0; 4][..(bin - written) as usize])?;
+    out.flush()?;
+    Ok(())
+}
 /// Materials, textures, images and samplers for the primitives of `meshes`, whose material
-/// indices it points at the written materials. Copies the images the output doesn't refer to in
-/// place.
+/// indices it points at the written materials, with the file of each image in order. Copies the
+/// images the output doesn't refer to in place, unless it `embed`s them, which leaves them
+/// without a URI for `embed_images`.
 fn appearance(
     scene: &Scene,
     meshes: &mut [Value],
@@ -470,9 +564,11 @@ fn appearance(
     transparent: &HashSet<PathBuf>,
     folder: &Path,
     outputs: &mut Outputs,
-) -> Res<Map<String, Value>> {
+    embed: bool,
+) -> Res<(Map<String, Value>, Vec<PathBuf>)> {
     let mut textures = Vec::new();
     let mut image_list = Vec::new();
+    let mut contents = Vec::new();
     let mut samplers = Vec::new();
     let mut image_ids = HashMap::new();
     let mut sampler_ids = HashMap::new();
@@ -513,8 +609,13 @@ fn appearance(
             let image = match image_ids.get(&path) {
                 Some(id) => *id,
                 None => {
-                    plan.publish(folder, outputs)?;
-                    image_list.push(json!({"uri":plan.uri}));
+                    if embed {
+                        image_list.push(json!({"mimeType":plan.mime_type()}));
+                    } else {
+                        plan.publish(folder, outputs)?;
+                        image_list.push(json!({"uri":plan.uri}));
+                    }
+                    contents.push(plan.content.clone());
                     image_ids.insert(path.clone(), image_list.len() - 1);
                     image_list.len() - 1
                 }
@@ -573,7 +674,7 @@ fn appearance(
         look.insert("textures".into(), json!(textures));
         look.insert("samplers".into(), json!(samplers));
     }
-    Ok(look)
+    Ok((look, contents))
 }
 /// URI path component escaping (not filesystem escaping).
 pub fn uri(name: &str) -> String {
@@ -631,6 +732,25 @@ mod tests {
                 accessors[position]["count"].as_u64().unwrap()
             })
             .collect()
+    }
+    #[test]
+    fn a_glb_refuses_what_its_lengths_cannot_describe() {
+        let dir = std::env::temp_dir().join(format!("mesh2gltf-glb-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let (payload, image, glb) = (dir.join("payload"), dir.join("image"), dir.join("out.glb"));
+        fs::write(&payload, [0; 8]).unwrap();
+        fs::write(&image, [1; 3]).unwrap();
+        let root = json!({"asset":{"version":"2.0"}});
+        let mut outputs = Outputs::default();
+        let error = write_glb(&glb, &root, &payload, &[], 1 << 32, &mut outputs).unwrap_err();
+        assert!(error.to_string().contains("4 GiB"), "{error}");
+        assert!(!glb.exists());
+        // An image shorter than the length its buffer view records.
+        let images = [(image, 8, 5)];
+        assert!(write_glb(&glb, &root, &payload, &images, 13, &mut outputs).is_err());
+        drop(outputs);
+        assert!(!glb.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn primitives_split_only_at_the_index_limit() {

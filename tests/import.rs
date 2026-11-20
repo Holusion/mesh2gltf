@@ -750,6 +750,164 @@ fn jpg_and_png_are_used_as_they_are() {
         assert_eq!(image_uri(&f, "out.gltf"), format!("source.{extension}"));
     }
 }
+/// The JSON and binary chunk of a GLB, after checking its container.
+fn read_glb(path: &std::path::Path) -> (Value, Vec<u8>) {
+    let glb = fs::read(path).unwrap();
+    let word = |at: usize| u32::from_le_bytes(glb[at..at + 4].try_into().unwrap()) as usize;
+    assert_eq!(&glb[..4], b"glTF");
+    assert_eq!(word(4), 2);
+    assert_eq!(word(8), glb.len());
+    let json_length = word(12);
+    assert_eq!(&glb[16..20], b"JSON");
+    assert_eq!(json_length % 4, 0);
+    let json = &glb[20..20 + json_length];
+    let bin_at = 20 + json_length;
+    let bin_length = word(bin_at);
+    assert_eq!(&glb[bin_at + 4..bin_at + 8], b"BIN\0");
+    assert_eq!(bin_length % 4, 0);
+    assert_eq!(bin_at + 8 + bin_length, glb.len());
+    let root: Value = serde_json::from_slice(json).unwrap();
+    (root, glb[bin_at + 8..].to_vec())
+}
+#[test]
+fn glb_holds_the_geometry_and_images_in_one_file() {
+    let f = textured_fixture("jpg");
+    let jpg = fs::read(f.0.join("source.jpg")).unwrap();
+    image::RgbImage::from_pixel(3, 1, image::Rgb([200, 10, 10]))
+        .save(f.0.join("second.bmp"))
+        .unwrap();
+    f.file(
+        "in.mtl",
+        "newmtl paint\nmap_Kd source.jpg\nnewmtl other\nmap_Kd second.bmp\n",
+    );
+    f.file("in.obj", "mtllib in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl paint\nf 1/1 2/1 3/1\nusemtl other\nf 1/1 3/1 2/1\n");
+    fs::create_dir(f.0.join("destination")).unwrap();
+    let before = fs::read_dir(&f.0).unwrap().count();
+    let result = import_images(&f, "destination/out.glb", &["--images", "copy"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // No .bin, copied texture or workspace left beside it or beside the input.
+    let written: Vec<_> = fs::read_dir(f.0.join("destination"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(written, ["out.glb"]);
+    assert_eq!(fs::read_dir(&f.0).unwrap().count(), before);
+    let (root, bin) = read_glb(&f.0.join("destination/out.glb"));
+    let buffer = &root["buffers"][0];
+    assert!(buffer.get("uri").is_none(), "{buffer}");
+    let byte_length = buffer["byteLength"].as_u64().unwrap() as usize;
+    assert_eq!(byte_length.next_multiple_of(4), bin.len());
+    let positions = root["meshes"][0]["primitives"][0]["attributes"]["POSITION"]
+        .as_u64()
+        .unwrap() as usize;
+    let mut corners = floats(&root, &bin, positions, 3);
+    corners.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(corners, [[0., 0., 0.], [0., 1., 0.], [1., 0., 0.]]);
+    let image = |i: usize| {
+        let image = &root["images"][i];
+        assert!(image.get("uri").is_none(), "{image}");
+        let view = &root["bufferViews"][image["bufferView"].as_u64().unwrap() as usize];
+        let offset = view["byteOffset"].as_u64().unwrap() as usize;
+        assert_eq!(offset % 4, 0);
+        let length = view["byteLength"].as_u64().unwrap() as usize;
+        (
+            image["mimeType"].as_str().unwrap().to_owned(),
+            bin[offset..offset + length].to_vec(),
+        )
+    };
+    assert_eq!(image(0), ("image/jpeg".to_owned(), jpg));
+    let (mime, png) = image(1);
+    assert_eq!(mime, "image/png");
+    assert_eq!(
+        image::load_from_memory(&png).unwrap().to_rgb8(),
+        image::open(f.0.join("second.bmp")).unwrap().to_rgb8()
+    );
+}
+#[test]
+fn glb_refuses_images_keep_and_an_existing_file() {
+    let f = textured_fixture("png");
+    let result = import_images(&f, "out.glb", &["--images", "keep"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(2), "{stderr}");
+    assert!(!f.0.join("out.glb").exists());
+    // A .bin of the same name is no output of a .glb, so it doesn't stand in the way.
+    f.file("out.bin", "unrelated");
+    let result = import_images(&f, "out.glb", &[]);
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let glb = fs::read(f.0.join("out.glb")).unwrap();
+    let result = import_images(&f, "out.glb", &[]);
+    assert_eq!(result.status.code(), Some(4));
+    assert_eq!(fs::read(f.0.join("out.glb")).unwrap(), glb);
+    assert_eq!(fs::read(f.0.join("out.bin")).unwrap(), b"unrelated");
+}
+#[test]
+fn files_whose_folders_were_lost_are_found_by_name() {
+    // As an upload of loose files leaves them: every folder the references name is gone.
+    let f = textured_fixture("png");
+    f.file("in.mtl", "newmtl paint\nmap_Kd textures/source.png\n");
+    f.file(
+        "in.obj",
+        "mtllib materials/in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl paint\nf 1/1 2/1 3/1\n",
+    );
+    let result = import_images(&f, "out.gltf", &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Warning: references found by name beside the file that makes them, not at their written path: 2, for example materials/in.mtl, textures/source.png"),
+        "{stderr}"
+    );
+    assert_eq!(image_uri(&f, "out.gltf"), "source.png");
+    let result = import_images(&f, "exact.gltf", &["--exact-paths"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("mtllib materials/in.mtl: not found, or outside the model's folder"),
+        "{stderr}"
+    );
+    // Absolute paths too are only looked for where written.
+    f.file(
+        "in.mtl",
+        "newmtl paint\nmap_Kd C:\\Users\\bob\\source.png\n",
+    );
+    f.file(
+        "in.obj",
+        "mtllib in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl paint\nf 1/1 2/1 3/1\n",
+    );
+    let result = import_images(&f, "absolute.gltf", &[]);
+    assert!(result.status.success());
+    let result = import_images(&f, "exact.gltf", &["--exact-paths"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(!f.0.join("exact.gltf").exists());
+}
+#[test]
+fn textures_meeting_on_one_file_by_name_are_refused() {
+    let f = textured_fixture("png");
+    f.file(
+        "in.mtl",
+        "newmtl a\nmap_Kd a/source.png\nnewmtl b\nmap_Kd b/source.png\n",
+    );
+    f.file(
+        "in.obj",
+        "mtllib in.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nusemtl a\nf 1/1 2/1 3/1\nusemtl b\nf 1/1 3/1 2/1\n",
+    );
+    let result = import_images(&f, "out.glb", &[]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Texture b/source.png: found only by name, as source.png, which a/source.png also leads to; the files can't be told apart"),
+        "{stderr}"
+    );
+    assert!(!f.0.join("out.glb").exists());
+}
 #[test]
 fn conversion_preserves_alpha() {
     let f = textured_fixture("tga");

@@ -36,13 +36,29 @@ pub struct Options {
     /// Let the output refer to images outside its own folder: `run` sets this from
     /// `--trusted`.
     pub outside_references: bool,
+    /// The output carries its images in its binary chunk, as a `.glb` does: none is copied or
+    /// referred to by URI. `run` sets this from the output's extension.
+    pub embed: bool,
 }
 pub struct Plan {
     pub content: PathBuf,
     pub publish_name: Option<String>,
+    /// Empty when the output embeds its images.
     pub uri: String,
 }
 impl Plan {
+    /// The MIME type a `.glb` records for the embedded image: `prepare` leaves only JPG and PNG.
+    pub fn mime_type(&self) -> &'static str {
+        let png = self
+            .content
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+        if png {
+            "image/png"
+        } else {
+            "image/jpeg"
+        }
+    }
     /// Copies the image into the output's `folder`, unless the output refers to it in place.
     pub fn publish(&self, folder: &Path, outputs: &mut Outputs) -> Res<()> {
         if let Some(name) = &self.publish_name {
@@ -126,7 +142,9 @@ pub fn prepare(
             source.clone()
         };
         check_image(&content).with_context(|| format!("Texture {}", shown(&source)))?;
-        let uri = if copy {
+        let uri = if options.embed {
+            String::new()
+        } else if copy {
             uri(&name)
         } else {
             kept_uri(&source, &destination, options)?
@@ -135,7 +153,7 @@ pub fn prepare(
             source,
             Plan {
                 content,
-                publish_name: copy.then_some(name),
+                publish_name: (copy && !options.embed).then_some(name),
                 uri,
             },
         );
