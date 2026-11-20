@@ -1,9 +1,11 @@
-# FBX (`.fbx`) import: how to decide the implementation
+# FBX (`.fbx`) import
 
-Working note for the `fbx-support` branch, which starts from the COLLADA plan because it shares
-its scene layer (`COLLADA-DRAFT.md`, "Shared scene layer"). Delete it before merging.
+Working note for the `fbx-support` branch. Delete it before merging. The branch sits on
+`collada-support`'s implementation (`9f593ea`), whose scene layer (`src/scene.rs`,
+`COLLADA-DRAFT.md` "Shared scene layer") FBX uses.
 
-This draft doesn't plan the importer yet. It plans the evaluation that chooses how to build it.
+The evaluation below chose **A, our own `fbx.rs`**. "Plan for A", at the end, lists what's
+needed before the importer starts, the decisions left to you, and the implementation order.
 
 ## Constraints the choice must respect
 
@@ -114,16 +116,7 @@ These thresholds are proposals for you to adjust before the decision is taken.
 
 A "Results" section in this file: the feature-usage table, the representative set, the `ufbx`
 measurements, placement comparisons, both line estimates, and a recommendation with its reasons.
-Committed on `fbx-support`. No importer code until you've chosen.
-
-## Expected scope of the importer, either way
-
-Static meshes with their transforms, reuse, axes and units; Lambert and Phong materials through
-the shared Phong constructor; diffuse textures, external or embedded (an embedded one is written
-to the workspace and then goes through `images.rs` as usual); skinned meshes in bind pose. Omitted
-with a counted warning: animation, blend shapes, NURBS and curves, cameras, lights, extra UV sets.
-Per-corner vertex colors depend on the survey: COLLADA skips them, so FBX would bring them to
-the shared layer if they are common.
+Committed on `fbx-support`. Delivered below; A was chosen.
 
 ## Results
 
@@ -231,11 +224,20 @@ post-rotation, pivots and offsets, geometric transform, property templates, axes
 
 - **Direct composition against `ufbx`:** equal within 6×10⁻⁵ on all 18 FBX 7 files it ran on,
   including post-rotation, rotation order, pivots, geometric rotation and scaling, negative scale,
-  Revit's Z-up feet and the three unusual axis systems. Not run on the 9 files over 500 MB, or on
-  ASCII and FBX 6, which the prototype doesn't read.
+  Revit's Z-up feet and the three unusual axis systems. Not run on ASCII and FBX 6, which the
+  prototype doesn't read.
+- **Large files, run on 2026-11-20:** equal within 5×10⁻⁸, with the same instance counts, on
+  F3, F8, F6, F4 and Cinema 4D's largest, F9 (13,878 instances).
+  Revit's 174,050-mesh file and the 144,763-mesh F5 passed the 8 GB cap the run was given,
+  because the prototype holds the whole record tree; `fbx.rs` keeps only per-object records.
+  Houdini's largest is ASCII. Results in `out/data/place-big.jsonl`.
+- **`InheritType` other than RSrs:** the only FBX 7 file with it (type 2, 94 models) is a
+  skeleton with no mesh. The other six are FBX 6 (type 0): F10 in two versions, F11, F12,
+  F13 and F14. So the corpus never tested it on FBX 7 geometry.
 - **Blender 5.2 against `ufbx`:** equal on 5 files (3ds Max, Assimp, Blender, Maya, Modo), with
   triangle counts within 0.03 %. Different on Cinema 4D's largest: 7.79 M triangles against 6.28 M,
-  and bounds 5.7 times the size apart; not investigated. Blender refuses ASCII FBX, so it can't
+  and bounds 5.7 times the size apart; not investigated. `ufbx` and the direct composition agree
+  with each other on that file, so the difference is Blender's. Blender refuses ASCII FBX, so it can't
   check the largest file. Blender's peak memory was 15 GB on the 2.36 GB 3ds Max file.
 - **Stopped:** Claude Code stopped the Blender runs, while Revit's 2.66 GB file was importing,
   because the machine ran low on memory. The other 22 Blender comparisons weren't made, and the
@@ -304,3 +306,127 @@ Where the thresholds might move:
   its warning, is enough.
 - **Heap per object:** files with 145,000–174,000 objects will test the per-object records and
   the glTF JSON writer, which already takes 417 MB for COLLADA's 27,000 parts.
+
+## Plan for A
+
+### Before `fbx.rs`: shared work, in order
+
+Items 2 to 5 change code every importer uses, so each lands as its own commit ahead of FBX,
+with tests, and flat formats' output stays byte-identical.
+
+1. **Settle the base.** `fbx-support` sits on `collada-support`, which sits on `ply-support`;
+   neither is on `main`. COLLADA's open items (its README, AGENTS.md and wiki updates, and the
+   per-object origin in item 3) are best settled first, so FBX doesn't build on a layer that then
+   moves.
+2. **Write the glTF JSON without building it whole.** `gltf.rs` builds the document as one
+   `serde_json::Value`, about 13 KiB per mesh: 417 MiB on D8. FBX's two files with the
+   most objects have 174,050 and 144,763 meshes, so about 2.2 and 1.8 GiB of heap for the JSON
+   alone, the cost that ruled B out. Keeping compact per-mesh records (indices, counts, bounds)
+   and serialising them at the end brings that to a few hundred bytes per mesh. `serde_json`
+   writes keys sorted, so the writer keeps that order to leave existing outputs unchanged.
+3. **Decide on one origin per object** (COLLADA open problem 1). 26 FBX files have positions over
+   10⁵ in their own coordinates, up to 7.2 million, mostly 3ds Max. With one global origin,
+   float32 keeps millimetres or worse there. The mesh child node already restores any origin, so
+   this changes the scene layer's decision, not its structure. Deciding it now avoids changing two
+   importers' output later.
+4. **Embedded textures in `images.rs`.** A texture mesh2gltf writes into the workspace is always
+   copied, never kept by reference, since the workspace is removed. It is outside `references.rs`
+   confinement because mesh2gltf wrote it, and its name, which comes from the file, is replaced by
+   the usual `{stem}_texture_{n}` name. About 20 lines.
+5. **Raise the face limit.** `MAX_FACE` (4,096, shared by OBJ, PLY and COLLADA) rejects 3 Maya
+   files, with up to 4,836 corners. 8,192 covers the corpus. A hostile test then times
+   triangulation of an 8,192-corner worst case, since ear clipping slows faster than linearly.
+6. **Inflate.** `flate2` 1.1 is already in `Cargo.lock` through `png` and `tiff`; a direct
+   dependency adds no crate. One decoder per array read in lockstep, about 40 KB each.
+7. **Test fixtures.** Corpus files name clients and can't enter the repository. A helper in
+   `tests/` writes binary FBX (header, 32- and 64-bit records, typed properties, raw and deflated
+   arrays) and ASCII FBX, as `dae()` builds XML. About 100 lines.
+8. **Recount missing textures with the importer's lookup.** The survey's 211 files count a
+   texture as missing even when its `Video` embeds it, and it never tries the absolute `FileName`.
+   Counting again with embedded content, then `RelativeFilename`, then `FileName`, then the bare
+   name beside the file sizes decision 1 below. That needs the survey reader (`out/fbxsurvey`) and
+   about the survey's run time over the 762 files.
+9. **Blender reference, with your go-ahead.** Blender 5.2's FBX importer exists, unlike its
+   COLLADA one, so it stays the reference. Its runs stopped at 9 of 31. It took 15 GB on a 2.36 GB
+   file, so the rest would run only on files under 1 GB, one at a time, capped at half the RAM:
+   about 15 files. Cinema 4D's file needs explaining before Blender is followed there.
+
+### Decisions for you
+
+| # | Question | Corpus | Recommendation |
+| --- | --- | --- | --- |
+| 1 | Does a missing texture still fail the conversion? | 211 files before the recount (item 8) | Look up embedded content, `RelativeFilename`, `FileName`, then the bare name beside the file, as Blender does, and keep the rule after that |
+| 2 | Per-corner vertex colours | 24 files per corner (`ByPolygonVertex`), 21 per position (`ByVertice`), 3 `AllSame` | Per-position and `AllSame` into the existing `vc` spool; per-corner omitted with a warning, as COLLADA does. Carrying them means a colour index in the face record, a change to every importer |
+| 3 | `InheritType` 0 (RrSs) and 2 (Rrs) | 6 FBX 6 files; on FBX 7, only a skeleton without mesh | Compose as RSrs, with a warning that counts only the models where the result differs (a non-uniform parent scale above a rotation for 0, any parent scale for 2). Compensating exactly can give shear, which a glTF node can't hold |
+| 4 | Several UV sets | 104 files | The set the diffuse texture names (`UVSet`), else the first; the others omitted with a warning |
+| 5 | Shared geometry with other materials | 1 file, 282 instances | The scene layer's first-binding rule and its warning |
+| 6 | Module split | | `fbxread.rs` for the binary and ASCII record readers (about 370 lines, tested alone) and `fbx.rs` for FBX's meaning (about 1,100), rather than one 1,500-line file |
+
+### What the importer does
+
+- **Reading:** the input is memory-mapped, as for COLLADA. Two passes. The index pass walks the
+  records and keeps per-object records and byte ranges; the decode pass reads each geometry's
+  arrays from the map into the spools. Binary records carry their end offset, so arrays are
+  skipped in the index pass. ASCII gives the same record events from text, streamed, with no
+  tree.
+- **Index pass:** `GlobalSettings` gives the `Basis` (a signed permutation, rejected otherwise)
+  and the unit (`UnitScaleFactor / 100` metres). `Definitions` gives property templates.
+  `Objects`: each `Model` gets its local and geometric matrices computed at once from its
+  properties over the template (the prototype's `place.rs`); each `Geometry` keeps the byte ranges
+  of `Vertices`, `PolygonVertexIndex` and each layer with its mapping and reference types;
+  `Material`, `Texture` and `Video` keep what the material needs, `Content` as a range.
+  `Connections` keeps `OO` (child to parent) and `OP` (texture to material property). No property
+  maps are kept: the budget is a few hundred bytes per object, under 2 KiB with names. Revit's
+  174,050 meshes would then take under 350 MiB.
+- **Decode pass:** positions (f64 or f32) go to fixed point through `fixed_from_float`, normals
+  and UVs to their spools, once per geometry. `PolygonVertexIndex` (a negative index `-(i+1)`
+  ends a polygon) is read in lockstep with each layer: `ByPolygonVertex`, `ByVertice`,
+  `ByPolygon` and `AllSame`, each `Direct` or `IndexToDirect`. Per-polygon materials index the
+  model's material list. Layer indices past their array get COLLADA's zero-record repair and a
+  warning; position indices past it are an error. Inflate output is checked against the declared
+  length, so a deflate bomb stops at its declared size.
+- **Graph:** models become `scene::Node`s. Connections can come in any order, so nodes are
+  ordered parents first, with a cycle check and a node count before anything is built, as
+  `dae.rs` does for `instance_node`. Geometry goes to a mesh child node when its geometric
+  transform isn't identity. Models sharing a geometry share its glTF mesh. Subtrees without
+  triangles (cameras, lights, nulls, bones) are pruned.
+- **Materials:** Lambert and Phong through the shared Phong constructor, following Blender 5.2's
+  `import_fbx.py` (read from source when implementing, credited in comments). Diffuse texture
+  through `OP "DiffuseColor"` and its `Video`. Equal materials merge through `material::merge`.
+- **Omitted with one counted warning each:** skin deformers (the geometry stays as stored, under
+  its model, which is how Blender shows it unposed), blend shapes (`Shape` geometries), animation,
+  NURBS and lines, extra UV sets, per-corner colours (decision 2).
+- **FBX 6:** objects named instead of numbered, geometry inside its `Model`, `Properties60`,
+  connections by name.
+
+### Implementation order
+
+One commit per step, each with tests and passing `fmt`, `clippy -D warnings` and `test --locked`:
+
+1. Binary record reader: header, 32- and 64-bit records, properties, array headers, inflate, and
+   its bounds (nesting depth, records inside their parent, arrays inside the file).
+2. Index pass and decode pass for FBX 7 binary: geometry, layers, per-polygon materials, under
+   one node per model.
+3. Transforms, basis and unit, geometric transforms, shared geometry, `--center`.
+4. Materials, textures, embedded content.
+5. Skins, blend shapes and other geometry kinds, as warnings.
+6. ASCII reader, FBX 7 then FBX 6 (`*N { a: … }` arrays, plain lists, base64 `Content`; decimal
+   positions through `parse_decimal_fixed`).
+7. FBX 6 semantics: names, `Properties60`, geometry in models.
+8. Hardening in `tests/hostile.rs`: truncation at each record boundary, offsets past the end,
+   wrong array lengths, deflate bombs, cyclic and dangling connections, deep nesting, 2²⁰ models.
+9. Samples, memory measurements, README, AGENTS.md's code layout, and the wiki's Conversion and
+   How it works pages.
+
+### Validation
+
+- **Files:** the 31 of `out/data/representative.tsv`, plus the six FBX 6 files with `InheritType`
+  0, and the ones decision 1 makes fail, which should fail on their texture.
+- **Against `ufbx`:** triangle counts, less the zero-area faces mesh2gltf skips, and scene bounds,
+  from `out/data/ufbx.jsonl`, which has all 31 files, ASCII and FBX 6 included. The six
+  `InheritType` files still need a `ufbx` run.
+- **Against Blender:** where its run finished (item 9).
+- **Memory:** `tools/monitor_import.py` on the five largest and on the two files with the most
+  objects. The heap target is under 2 KiB per object and doesn't follow the geometry.
+- **Validator:** Khronos's on every output, apart from `.bin` files over 2 GiB, which it can't
+  read.
