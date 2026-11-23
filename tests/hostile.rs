@@ -1009,6 +1009,40 @@ fn a_library_named_by_an_absolute_path_with_spaces_is_found() {
     assert!(root["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"].is_array());
 }
 #[test]
+fn a_library_name_with_spaces_is_one_file_unless_every_part_ends_in_mtl() {
+    let u = Upload::new();
+    for (name, material) in [
+        ("a.mtl", "a"),
+        ("b.mtl", "b"),
+        ("my", "my"),
+        ("model.mtl", "model"),
+    ] {
+        u.write(name, &format!("newmtl {material}\nKd 1 0 0\n"));
+    }
+    let obj = |libraries: &str, materials: &[&str]| {
+        let faces: String = materials
+            .iter()
+            .map(|m| format!("usemtl {m}\nf 1 2 3\n"))
+            .collect();
+        u.write(
+            "in.obj",
+            &format!("mtllib {libraries}\nv 0 0 0\nv 1 0 0\nv 0 1 0\n{faces}"),
+        );
+    };
+    obj("a.mtl b.mtl", &["a", "b"]);
+    let out = u.run(&["in.obj", "-o", "out.gltf"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    // `my` and `model.mtl` exist, but the line names one file, which doesn't.
+    obj("my model.mtl", &["my", "model"]);
+    let stderr = u.stderr_of(&["in.obj", "-o", "other.gltf"]);
+    assert!(
+        stderr.contains(&format!("mtllib my model.mtl: {REFUSED}")),
+        "{stderr}"
+    );
+}
+#[test]
 fn keeping_images_never_writes_a_reference_outside_the_output_folder() {
     let input = "in.obj";
     let u = Upload::new();

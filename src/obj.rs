@@ -4,7 +4,7 @@
 use crate::{
     diagnostics::{safe, shown, Tally},
     failure::Context,
-    references::{References, Refused},
+    references::References,
     Res,
 };
 use crate::{
@@ -89,6 +89,23 @@ fn floats(rest: &str, count: usize) -> Res<Vec<f64>> {
 fn warn_once(warned: &mut HashSet<&'static str>, key: &'static str, message: &str) {
     if warned.insert(key) {
         crate::say!("Warning: {message}");
+    }
+}
+/// The libraries an `mtllib` statement names. The spec allows several, separated by spaces, but
+/// exporters such as Blender's also write one name with spaces in it, unquoted. It is read as
+/// several only when every part ends in `.mtl`, so `my model.mtl` is one file: this is decided
+/// from the text alone, never from which files exist.
+fn library_names(rest: &str) -> Vec<&str> {
+    let names: Vec<_> = rest.split_whitespace().collect();
+    let library = |name: &&str| {
+        Path::new(name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mtl"))
+    };
+    if names.len() > 1 && names.iter().all(library) {
+        names
+    } else {
+        vec![rest]
     }
 }
 /// OBJ and PLY vertex colours are display (sRGB) values; glTF `COLOR_0` is linear.
@@ -335,18 +352,9 @@ pub fn spool(
                             &mut library_warnings,
                         )
                     };
-                    // One file name with spaces in it, or several names.
-                    let whole = match libraries.resolve(parent, rest) {
-                        Err(e) if !e.is::<Refused>() => return Err(e),
-                        whole => whole.ok(),
-                    };
-                    if let Some(file) = whole.filter(|file| file.is_file()) {
-                        load(&file)?;
-                    } else {
-                        for name in rest.split_whitespace() {
-                            let file = libraries.resolve(parent, name);
-                            load(&file.with_context(|| format!("mtllib {}", safe(name)))?)?;
-                        }
+                    for name in library_names(rest) {
+                        let file = libraries.resolve(parent, name);
+                        load(&file.with_context(|| format!("mtllib {}", safe(name)))?)?;
                     }
                 }
                 "f" => {
@@ -504,4 +512,20 @@ pub fn fetch<const N: usize>(spool: &[u8], index: u64, count: u64) -> Res<[[u8; 
 pub fn color(spool: &[u8], v: u64, count: u64) -> Res<Option<[f64; 3]>> {
     let rgb = fetch::<3>(spool, v, count)?.map(f64::from_le_bytes);
     Ok((!rgb[0].is_nan()).then_some(rgb))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn several_libraries_only_when_every_name_is_one() {
+        assert_eq!(library_names("a.mtl"), ["a.mtl"]);
+        assert_eq!(library_names("a.mtl b.MTL"), ["a.mtl", "b.MTL"]);
+        assert_eq!(library_names("my model.mtl"), ["my model.mtl"]);
+        assert_eq!(
+            library_names("C:\\My Files\\in.mtl"),
+            ["C:\\My Files\\in.mtl"]
+        );
+        assert_eq!(library_names("a.mtl notes"), ["a.mtl notes"]);
+        assert_eq!(library_names("my.v2 final.mtl"), ["my.v2 final.mtl"]);
+    }
 }
