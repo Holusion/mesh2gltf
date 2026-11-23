@@ -191,3 +191,64 @@ fn an_upload_meeting_every_requirement_converts() {
     let root: Value = serde_json::from_slice(&fs::read(f.0.join("in.gltf")).unwrap()).unwrap();
     assert_eq!(root["images"][0]["uri"], "diffuse.png");
 }
+#[test]
+fn a_library_in_a_subfolder_may_climb_as_far_as_the_root() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("mtl")).unwrap();
+    fs::create_dir_all(f.0.join("tex")).unwrap();
+    f.file("scan.obj", &format!("mtllib mtl/m.mtl\n{TRIANGLE}"));
+    f.file(
+        "mtl/m.mtl",
+        "newmtl m\nmap_Kd ../tex/d.png\nnewmtl n\nmap_Kd ../../d.png\n",
+    );
+    // Alone, the library's own folder is the root, so `..` leaves it.
+    assert_eq!(f.requires("mtl/m.mtl", &[]), json!([["d.png"]]));
+    // `../../d.png` still leaves it, so only its name is looked for.
+    let requires = json!([["../tex/d.png", "d.png"], ["d.png"]]);
+    assert_eq!(f.requires("mtl/m.mtl", &["--root", "."]), requires);
+    let root = f.0.to_str().unwrap();
+    assert_eq!(f.requires("mtl/m.mtl", &["--root", root]), requires);
+    // The first path, taken from the library's folder, is where the conversion finds it.
+    image::RgbImage::new(2, 2)
+        .save(f.0.join("mtl/../tex/d.png"))
+        .unwrap();
+    f.file("mtl/m.mtl", "newmtl m\nmap_Kd ../tex/d.png\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
+        .arg(f.0.join("scan.obj"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+#[test]
+fn the_root_must_hold_the_input_and_only_serves_inspection() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("mtl")).unwrap();
+    fs::create_dir_all(f.0.join("other")).unwrap();
+    f.file("mtl/m.mtl", "newmtl m\n");
+    for (args, message) in [
+        (
+            &["--inspect", "mtl/m.mtl", "--root", "other"][..],
+            "--root must be a folder holding the input",
+        ),
+        (
+            &["--inspect", "mtl/m.mtl", "--root", "missing"],
+            "--root must be a folder holding the input",
+        ),
+        (
+            &["--inspect", "mtl/m.mtl", "--root", ".", "--trusted"],
+            "--root doesn't apply with --trusted",
+        ),
+        (
+            &["mtl/m.mtl", "--root", "."],
+            "--root only applies to --inspect",
+        ),
+    ] {
+        let (code, stderr) = f.refused(args);
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+}

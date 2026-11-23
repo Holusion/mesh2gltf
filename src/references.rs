@@ -121,8 +121,15 @@ impl References {
         let base = non_empty(base);
         let written = reference.replace('\\', "/");
         if let Some(listed) = &self.listed {
-            // The referencing file's folder stands for the root, as it does for the input.
-            let (at_written, name) = self.lookups(&written, 0);
+            // Only the referencing file's folder is looked up, never what the reference names.
+            let depth = match &self.root {
+                Some(root) => fs::canonicalize(base)
+                    .ok()
+                    .and_then(|base| Some(base.strip_prefix(root).ok()?.components().count()))
+                    .ok_or(Refused)?,
+                None => 0,
+            };
+            let (at_written, name) = self.lookups(&written, depth);
             let mut tries: Vec<String> = at_written
                 .then(|| tidied(&written))
                 .flatten()

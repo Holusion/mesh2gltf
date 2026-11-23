@@ -69,6 +69,8 @@ pub struct Options {
     pub exact_paths: bool,
     /// Report the files the input refers to instead of converting it.
     pub inspect: bool,
+    /// For `inspect`: the folder references must stay in, rather than the input's, which it holds.
+    pub root: Option<PathBuf>,
 }
 fn run(mut opts: Options) -> Res<()> {
     if opts.inspect {
@@ -102,11 +104,20 @@ fn run(mut opts: Options) -> Res<()> {
 }
 /// Prints `{"requires": [[path, ...], ...]}`: for each file the input refers to, the paths it is
 /// looked for at, in order, relative to the input's folder. It is met by the first that exists.
+/// A path may climb with `..` as far as `--root`, where the model's other files are.
 /// Only the input is read, so each file of a model can be inspected alone, in any order, and the
 /// files it names need not exist yet.
 fn inspect(opts: &Options) -> Res<()> {
     let input = &opts.input;
-    let references = References::for_input(parent(input), opts.trusted, !opts.exact_paths)
+    let root = opts.root.as_deref().unwrap_or(parent(input));
+    // The model's folder, when the input is one of its files in a folder below.
+    let holds_input = fs::canonicalize(root)
+        .and_then(|root| Ok(fs::canonicalize(parent(input))?.starts_with(root)));
+    if !holds_input.unwrap_or(false) {
+        let message = "--root must be a folder holding the input";
+        return Err(failure::Usage(message.into()).into());
+    }
+    let references = References::for_input(root, opts.trusted, !opts.exact_paths)
         .with_context(|| "Input directory".into())?
         .listing();
     let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("");

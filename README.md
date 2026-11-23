@@ -23,7 +23,7 @@ A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any cop
 
 ```text
 mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
-mesh2gltf --inspect [--trusted] [--exact-paths] <file.obj|file.mtl|file.ply>
+mesh2gltf --inspect [--root DIR] [--trusted] [--exact-paths] <file.obj|file.mtl|file.ply>
 
 -o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)
     --center       Move the bounding-box center to 0, dropping the model's position
@@ -35,6 +35,7 @@ mesh2gltf --inspect [--trusted] [--exact-paths] <file.obj|file.mtl|file.ply>
     --trusted      Let the model refer to files outside its folder
     --exact-paths  Follow references only to their written path, never by name
     --inspect      Print, as JSON, the files an .obj, .mtl or .ply refers to; convert nothing
+    --root DIR     With --inspect: the folder references must stay in (default: the input's)
     --progress     Report reading and conversion progress on stderr
 -h, --help         Show help
 ```
@@ -64,6 +65,8 @@ $ mesh2gltf --inspect model.mtl
 
 Each entry of `requires` is one file, given as the paths the conversion will look for it at, in order: relative to the inspected file's folder, with forward slashes, and following the rules above, so `--trusted` and `--exact-paths` change it as they change the conversion. The file is found at the first of these paths that exists. Once every entry has at least one of its paths among the uploaded files, the model's references are complete. Here `C:\Users\bob\wall.png` in the MTL is met by `wall.png` beside it.
 
+A conversion keeps references inside the input's folder, so a library in a folder below it may reach back up with `..`. Inspected alone, that library would take its own folder as the limit. `--root DIR` gives the model's folder instead, which must hold the inspected file: with `scan.obj` naming `mtl/m.mtl`, which names `../tex/d.jpg`, `mesh2gltf --inspect mtl/m.mtl --root .` requires `[["../tex/d.jpg","d.jpg"]]`. Paths stay relative to the inspected file's folder. `--root` doesn't apply to a conversion, nor with `--trusted`.
+
 An OBJ requires the libraries its first `mtllib` names. Exporters write it before any geometry, so reading stops there, and only an OBJ without one is read to the end. An MTL requires the texture of every material it defines, used or not, since the conversion needs them all. A PLY requires its `comment TextureFile`s when it has texture coordinates, and only its header is read. VRML can't be inspected.
 
 A reference the conversion would refuse, such as a URL, or a file the conversion would reject before following its references, such as a PLY point cloud or an unsupported `map_Kd` option, fails the inspection with the conversion's message and exit code. Two references meeting on one file found by name are only detected by the conversion, which can see which files exist.
@@ -76,7 +79,7 @@ Messages on stderr can be shown to whoever supplied the model. A file is shown b
 | ---- | ------- |
 | 0 | Success |
 | 1 | The input was rejected, including an input that isn't `.obj`, `.ply`, `.wrl` or `.vrml`, a PLY without faces (point clouds aren't supported), and a model too large for a `.glb` |
-| 2 | The command line is wrong, including `--inspect` with a conversion option such as `-o`, `--images keep` with a `.glb`, or with an output folder that doesn't hold the input's images |
+| 2 | The command line is wrong, including `--inspect` with a conversion option such as `-o`, a `--root` that doesn't hold the input, `--images keep` with a `.glb`, or with an output folder that doesn't hold the input's images |
 | 3 | A resource limit was reached: the disk is full, or a quota or file-size limit |
 | 4 | Another problem with the machine, such as permissions, a missing output directory or an output that already exists |
 | 101 | Internal error (a panic) |
