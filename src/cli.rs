@@ -18,8 +18,25 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
     let mut no_color = false;
     let mut trusted = false;
     let mut exact_paths = false;
+    let mut inspect = false;
+    // The first option given that only means something to a conversion.
+    let mut converting = None;
     let mut images = images::Options::default();
     while let Some(arg) = args.next() {
+        if matches!(
+            arg.as_str(),
+            "-o" | "--output"
+                | "--tmp-dir"
+                | "--center"
+                | "--up-axis"
+                | "--images"
+                | "--progress"
+                | "--keep-tmp"
+                | "--no-color"
+        ) || arg.starts_with("--images=")
+        {
+            converting.get_or_insert_with(|| arg.clone());
+        }
         match arg.as_str() {
             "--help" | "-h" => {
                 help();
@@ -56,16 +73,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
             "--no-color" => no_color = true,
             "--trusted" => trusted = true,
             "--exact-paths" => exact_paths = true,
+            "--inspect" => inspect = true,
             _ if arg.starts_with('-') => return Err(format!("Unknown option: {arg}").into()),
             _ if input.is_none() => input = Some(PathBuf::from(arg)),
             _ => return Err(format!("Unexpected argument: {arg}").into()),
         }
     }
     let input = input.ok_or("Missing input file")?;
+    if let Some(option) = converting.filter(|_| inspect) {
+        return Err(format!("--inspect converts nothing, so it doesn't take {option}").into());
+    }
     let output: PathBuf = output.unwrap_or_else(|| input.with_extension("gltf"));
     let glb = match output.extension().and_then(|s| s.to_str()) {
         Some("gltf") => false,
         Some("glb") => true,
+        _ if inspect => false,
         _ => return Err("Output must have a .gltf or .glb extension".into()),
     };
     if glb && matches!(images.mode, images::Mode::Keep) {
@@ -89,8 +111,9 @@ pub fn parse(args: impl Iterator<Item = String>) -> Res<Option<Options>> {
         no_color,
         trusted,
         exact_paths,
+        inspect,
     }))
 }
 fn help() {
-    println!("Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>\n\nImport OBJ, PLY or VRML IndexedFaceSet geometry into glTF 2.0: .gltf + external .bin, or one .glb.\n\n  -o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)\n      --center       Move the bounding-box center to 0, dropping the model's position\n      --up-axis AXIS Source up axis: y (default) or z; output is Y-up\n      --tmp-dir DIR  Disk-backed geometry spools (default: output directory)\n      --keep-tmp     Keep conversion workspace for debugging\n      --images MODE  auto (default), keep source references, or copy images; a .glb embeds them\n      --no-color     Ignore vertex colors, keeping the material color on untextured faces\n      --trusted      Let the model refer to files outside its folder\n      --exact-paths  Follow references only to their written path, never by name\n      --progress     Report conversion progress on stderr\n  -h, --help         Show help");
+    println!("Usage: mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>\n       mesh2gltf --inspect [--trusted] [--exact-paths] <file.obj|file.mtl|file.ply>\n\nImport OBJ, PLY or VRML IndexedFaceSet geometry into glTF 2.0: .gltf + external .bin, or one .glb.\n\n  -o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)\n      --center       Move the bounding-box center to 0, dropping the model's position\n      --up-axis AXIS Source up axis: y (default) or z; output is Y-up\n      --tmp-dir DIR  Disk-backed geometry spools (default: output directory)\n      --keep-tmp     Keep conversion workspace for debugging\n      --images MODE  auto (default), keep source references, or copy images; a .glb embeds them\n      --no-color     Ignore vertex colors, keeping the material color on untextured faces\n      --trusted      Let the model refer to files outside its folder\n      --exact-paths  Follow references only to their written path, never by name\n      --inspect      Print, as JSON, the files an .obj, .mtl or .ply refers to; convert nothing\n      --progress     Report conversion progress on stderr\n  -h, --help         Show help");
 }

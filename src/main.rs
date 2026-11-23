@@ -67,8 +67,13 @@ pub struct Options {
     pub trusted: bool,
     /// Follow references only to their written path, never by name beside the referencing file.
     pub exact_paths: bool,
+    /// Report the files the input refers to instead of converting it.
+    pub inspect: bool,
 }
 fn run(mut opts: Options) -> Res<()> {
+    if opts.inspect {
+        return inspect(&opts);
+    }
     opts.images.outside_references = opts.trusted;
     opts.images.embed = opts.glb;
     let ext = opts
@@ -94,6 +99,44 @@ fn run(mut opts: Options) -> Res<()> {
         .with_context(|| "Input directory".into())?;
     let workspace = Workspace::create(&opts.tmp_dir, opts.keep_tmp)?;
     workspace.explain(convert(&opts, &ext, references, &workspace.path))
+}
+/// Prints `{"requires": [[path, ...], ...]}`: for each file the input refers to, the paths it is
+/// looked for at, in order, relative to the input's folder. It is met by the first that exists.
+/// Only the input is read, so each file of a model can be inspected alone, in any order, and the
+/// files it names need not exist yet.
+fn inspect(opts: &Options) -> Res<()> {
+    let input = &opts.input;
+    let references = References::for_input(parent(input), opts.trusted, !opts.exact_paths)
+        .with_context(|| "Input directory".into())?
+        .listing();
+    let ext = input.extension().and_then(|s| s.to_str()).unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "obj" => obj::inspect(input, &references)?,
+        "mtl" => {
+            let mut warnings = material::Warnings::new();
+            material::load(
+                input,
+                &references,
+                Origin::Model,
+                &mut Default::default(),
+                &mut warnings,
+            )?
+        }
+        "ply" => ply::inspect(input, &references)?,
+        _ => {
+            let ext = diagnostics::safe(ext);
+            return Err(format!("--inspect reads .obj, .mtl or .ply, not .{ext}").into());
+        }
+    }
+    // A texture shared by several materials is one requirement.
+    let mut requires = Vec::new();
+    for tries in references.listed() {
+        if !requires.contains(&tries) {
+            requires.push(tries);
+        }
+    }
+    println!("{}", serde_json::json!({ "requires": requires }));
+    Ok(())
 }
 fn convert(opts: &Options, ext: &str, references: References, workspace: &Path) -> Res<()> {
     let scene = match ext {

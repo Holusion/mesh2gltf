@@ -354,22 +354,17 @@ fn roles(element: &Element, unsupported: &mut Tally) -> Vec<Role> {
 fn write_all<const N: usize>(out: &mut impl Write, values: [[u8; 8]; N]) -> io::Result<()> {
     values.iter().try_for_each(|v| out.write_all(v))
 }
-/// `keep_colors` false reads vertex colours past, as if the file had none.
-pub fn spool(
-    input: &Path,
-    dir: &Path,
-    progress: bool,
-    references: &References,
-    keep_colors: bool,
-) -> Res<Scene> {
-    let file = File::open(input).with_context(|| shown(input))?;
-    let mut body = Body {
-        input: BufReader::with_capacity(256 * 1024, file),
-        format: Format::Ascii,
-        token: Vec::new(),
-    };
-    let header = header(&mut body.input).with_context(|| shown(input))?;
-    body.format = header.format;
+/// A PLY header checked as a mesh: what each property of each element means, and the materials
+/// its textures make, after the default one.
+struct Mesh {
+    header: Header,
+    roles: Vec<Vec<Role>>,
+    materials: Vec<Material>,
+}
+/// Reads the header of `input` from `reader`, which is left at the body, and follows its
+/// textures with `references`.
+fn mesh(input: &Path, reader: &mut impl BufRead, references: &References) -> Res<Mesh> {
+    let header = header(reader).with_context(|| shown(input))?;
     let mut unsupported = Tally::new("unsupported PLY properties omitted");
     let mut other_elements = Tally::new("unsupported PLY elements omitted");
     let reject = |message: &str| -> Failure { format!("{}: {message}", shown(input)).into() };
@@ -380,7 +375,7 @@ pub fn spool(
             "PLY file has no faces; point clouds are not supported",
         ));
     }
-    let (Some(vertex), None) = (find("vertex").next(), find("vertex").nth(1)) else {
+    let (Some(_), None) = (find("vertex").next(), find("vertex").nth(1)) else {
         return Err(reject("PLY file needs exactly one vertex element"));
     };
     if find("face").nth(1).is_some() {
@@ -404,12 +399,8 @@ pub fn spool(
     if !has(Role::Corners) {
         return Err(reject("PLY faces lack vertex_indices"));
     }
-    let normals = has(Role::Normal(0));
-    let colors = has(Role::Color(0));
-    let vertex_uvs = has(Role::Uv(0));
-    let wedges = has(Role::Wedges);
     let mut materials = vec![Material::new("default")];
-    if vertex_uvs || wedges {
+    if has(Role::Uv(0)) || has(Role::Wedges) {
         let base = input.parent().unwrap_or(Path::new("."));
         for name in &header.textures {
             let mut m = Material::new(name);
@@ -422,6 +413,47 @@ pub fn spool(
     } else if !header.textures.is_empty() {
         crate::say!("Warning: PLY textures omitted: the file has no texture coordinates");
     }
+    Ok(Mesh {
+        header,
+        roles,
+        materials,
+    })
+}
+/// Follows the textures of `input` with `references`, for `--inspect`. Only the header is read.
+pub fn inspect(input: &Path, references: &References) -> Res<()> {
+    let file = File::open(input).with_context(|| shown(input))?;
+    mesh(input, &mut BufReader::new(file), references)?;
+    Ok(())
+}
+/// `keep_colors` false reads vertex colours past, as if the file had none.
+pub fn spool(
+    input: &Path,
+    dir: &Path,
+    progress: bool,
+    references: &References,
+    keep_colors: bool,
+) -> Res<Scene> {
+    let file = File::open(input).with_context(|| shown(input))?;
+    let mut body = Body {
+        input: BufReader::with_capacity(256 * 1024, file),
+        format: Format::Ascii,
+        token: Vec::new(),
+    };
+    let Mesh {
+        header,
+        roles,
+        materials,
+    } = mesh(input, &mut body.input, references)?;
+    body.format = header.format;
+    let elements = &header.elements;
+    let find = |name: &'static str| elements.iter().filter(move |e| e.name == name);
+    // `mesh` checked there is exactly one.
+    let vertex = find("vertex").next().unwrap();
+    let has = |role: Role| roles.iter().flatten().any(|r| *r == role);
+    let normals = has(Role::Normal(0));
+    let colors = has(Role::Color(0));
+    let vertex_uvs = has(Role::Uv(0));
+    let wedges = has(Role::Wedges);
     let mut v = BufWriter::new(File::create(dir.join("v"))?);
     let mut vt = BufWriter::new(File::create(dir.join("vt"))?);
     let mut vn = BufWriter::new(File::create(dir.join("vn"))?);

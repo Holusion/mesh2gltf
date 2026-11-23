@@ -91,6 +91,122 @@ fn warn_once(warned: &mut HashSet<&'static str>, key: &'static str, message: &st
         crate::say!("Warning: {message}");
     }
 }
+/// One OBJ statement: the line it starts on, its keyword as written and lowercased, and the rest.
+struct Statement<'a> {
+    line: usize,
+    written: &'a str,
+    key: &'a str,
+    rest: &'a str,
+}
+/// An OBJ file read one statement at a time. Lines and statements are bounded even for corrupt or
+/// pathological input, rather than allocate arbitrarily.
+struct Statements<'a> {
+    reader: BufReader<File>,
+    location: &'a dyn Fn(usize) -> String,
+    progress: bool,
+    line: String,
+    /// A statement continued over several lines.
+    joined: String,
+    lowered: String,
+    line_no: usize,
+    bytes: usize,
+    next_progress: usize,
+    eof: bool,
+}
+impl<'a> Statements<'a> {
+    fn open(source: &Path, progress: bool, location: &'a dyn Fn(usize) -> String) -> Res<Self> {
+        let file = File::open(source).with_context(|| shown(source))?;
+        Ok(Self {
+            reader: BufReader::with_capacity(256 * 1024, file),
+            location,
+            progress,
+            line: String::new(),
+            joined: String::new(),
+            lowered: String::new(),
+            line_no: 0,
+            bytes: 0,
+            next_progress: 100_000_000,
+            eof: false,
+        })
+    }
+    fn next(&mut self) -> Res<Option<Statement<'_>>> {
+        self.joined.clear();
+        let mut start_line = 0;
+        loop {
+            if self.eof {
+                return Ok(None);
+            }
+            self.line.clear();
+            let size = Read::by_ref(&mut self.reader)
+                .take(1024 * 1024 + 1)
+                .read_line(&mut self.line)?;
+            self.eof = size == 0;
+            if self.eof && self.joined.is_empty() {
+                return Ok(None);
+            }
+            if size > 1024 * 1024 {
+                return Err("OBJ line exceeds 1 MiB limit".into());
+            }
+            if !self.eof {
+                self.bytes += size;
+                self.line_no += 1;
+            }
+            if self.progress && self.bytes >= self.next_progress {
+                crate::say!(
+                    "Spooling OBJ: {}",
+                    crate::format::fmt_bytes(self.bytes as u64)
+                );
+                self.next_progress = self.bytes + 100_000_000;
+            }
+            let stripped = self.line.split('#').next().unwrap().trim();
+            // A trailing backslash, optionally followed by whitespace, continues the statement on
+            // the next line, as in Blender's importer (`read_next_obj_line`), which applies it to
+            // every statement; obj2gltf only does so for faces. The OBJ spec shows it in examples
+            // without stating a rule. Comments are stripped first, so a comment never continues:
+            // a remark ending in a Windows path such as `C:\models\` must not swallow the next line.
+            let Some(head) = stripped.strip_suffix('\\').filter(|_| !self.eof) else {
+                if self.joined.is_empty() {
+                    start_line = self.line_no;
+                } else {
+                    self.joined.push_str(stripped);
+                }
+                break;
+            };
+            if self.joined.is_empty() {
+                start_line = self.line_no;
+            }
+            if self.joined.len() + head.len() >= 1024 * 1024 {
+                let at = (self.location)(start_line);
+                return Err(format!("{at}: OBJ statement exceeds 1 MiB limit").into());
+            }
+            self.joined.push_str(head);
+            self.joined.push(' ');
+        }
+        let text = if self.joined.is_empty() {
+            self.line.split('#').next().unwrap().trim()
+        } else {
+            self.joined.trim()
+        };
+        let (written, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        // Keywords match whatever their case, as in obj2gltf and three.js, as a safety net for
+        // exporters that capitalise them. No two OBJ keywords differ only by case. Only keys
+        // that need it are lowercased, so `v` lines allocate nothing.
+        let key = if written.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.lowered.clear();
+            self.lowered.push_str(written);
+            self.lowered.make_ascii_lowercase();
+            self.lowered.as_str()
+        } else {
+            written
+        };
+        Ok(Some(Statement {
+            line: start_line,
+            written,
+            key,
+            rest: rest.trim(),
+        }))
+    }
+}
 /// The libraries an `mtllib` statement names. The spec allows several, separated by spaces, but
 /// exporters such as Blender's also write one name with spaces in it, unquoted. It is read as
 /// several only when every part ends in `.mtl`, so `my model.mtl` is one file: this is decided
@@ -163,78 +279,14 @@ pub fn spool(
     let mut library_warnings = material::Warnings::new();
     let mut short_faces = 0u64;
     let mut record = Vec::new();
-    let mut reader = BufReader::with_capacity(
-        256 * 1024,
-        File::open(source).with_context(|| shown(source))?,
-    );
-    let mut line = String::new();
-    // A statement continued over several lines, and the line it started on.
-    let mut joined = String::new();
-    let mut start_line = 0;
-    let mut line_no = 0;
-    let mut bytes = 0;
-    let mut next_progress = 100_000_000;
-    // Bound records even for corrupt/pathological inputs, rather than allocate arbitrarily.
-    loop {
-        line.clear();
-        let size = Read::by_ref(&mut reader)
-            .take(1024 * 1024 + 1)
-            .read_line(&mut line)?;
-        let eof = size == 0;
-        if eof && joined.is_empty() {
-            break;
-        }
-        if size > 1024 * 1024 {
-            return Err("OBJ line exceeds 1 MiB limit".into());
-        }
-        if !eof {
-            bytes += size;
-            line_no += 1;
-        }
-        if progress && bytes >= next_progress {
-            crate::say!("Spooling OBJ: {}", crate::format::fmt_bytes(bytes as u64));
-            next_progress = bytes + 100_000_000;
-        }
-        let stripped = line.split('#').next().unwrap().trim();
-        // A trailing backslash, optionally followed by whitespace, continues the statement on the
-        // next line, as in Blender's importer (`read_next_obj_line`), which applies it to every
-        // statement; obj2gltf only does so for faces. The OBJ spec shows it in examples without
-        // stating a rule. Comments are stripped first, so a comment never continues: a remark
-        // ending in a Windows path such as `C:\models\` must not swallow the next line.
-        if let Some(head) = stripped.strip_suffix('\\').filter(|_| !eof) {
-            if joined.is_empty() {
-                start_line = line_no;
-            }
-            if joined.len() + head.len() >= 1024 * 1024 {
-                return Err(format!(
-                    "{}: OBJ statement exceeds 1 MiB limit",
-                    location(start_line)
-                )
-                .into());
-            }
-            joined.push_str(head);
-            joined.push(' ');
-            continue;
-        }
-        let continued = !joined.is_empty();
-        if continued {
-            joined.push_str(stripped);
-        } else {
-            start_line = line_no;
-        }
-        let text = if continued { joined.trim() } else { stripped };
-        let (written, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        // Keywords match whatever their case, as in obj2gltf and three.js, as a safety net for
-        // exporters that capitalise them. No two OBJ keywords differ only by case. Only keys
-        // that need it are lowercased, so `v` lines allocate nothing.
-        let lowered;
-        let key = if written.bytes().any(|b| b.is_ascii_uppercase()) {
-            lowered = written.to_ascii_lowercase();
-            lowered.as_str()
-        } else {
-            written
-        };
-        let rest = rest.trim();
+    let mut statements = Statements::open(source, progress, &location)?;
+    while let Some(Statement {
+        line,
+        written,
+        key,
+        rest,
+    }) = statements.next()?
+    {
         let result: Res<()> = (|| {
             match key {
                 "v" => {
@@ -403,11 +455,7 @@ pub fn spool(
             }
             Ok(())
         })();
-        result.with_context(|| location(start_line))?;
-        joined.clear();
-        if eof {
-            break;
-        }
+        result.with_context(|| location(line))?;
     }
     if short_faces > 0 {
         crate::say!("Warning: omitted {short_faces} faces with fewer than three corners");
@@ -428,6 +476,25 @@ pub fn spool(
         }
     }
     Ok(scene)
+}
+/// Follows the libraries the first `mtllib` statement names with `references`, for `--inspect`.
+/// Exporters write it before any geometry, so reading stops near the top of the file; only a file
+/// without one is read to the end.
+pub fn inspect(source: &Path, references: &References) -> Res<()> {
+    let location = |line: usize| format!("{}:{line}", shown(source));
+    let mut statements = Statements::open(source, false, &location)?;
+    while let Some(statement) = statements.next()? {
+        if statement.key == "mtllib" {
+            let parent = source.parent().unwrap_or(Path::new("."));
+            for name in library_names(statement.rest) {
+                let file = references.resolve(parent, name);
+                file.with_context(|| format!("mtllib {}", safe(name)))
+                    .with_context(|| location(statement.line))?;
+            }
+            break;
+        }
+    }
+    Ok(())
 }
 /// One face spool record.
 pub struct Face {
