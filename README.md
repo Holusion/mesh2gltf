@@ -23,6 +23,7 @@ A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any cop
 
 ```text
 mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
+mesh2gltf --inspect [--root DIR] [--trusted] [--exact-paths] <file.obj|file.mtl|file.ply>
 
 -o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)
     --center       Move the bounding-box center to 0, dropping the model's position
@@ -33,6 +34,8 @@ mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
     --no-color     Ignore vertex colors, keeping the material color on untextured faces
     --trusted      Let the model refer to files outside its folder
     --exact-paths  Follow references only to their written path, never by name
+    --inspect      Print, as JSON, the files an .obj, .mtl or .ply refers to; convert nothing
+    --root DIR     With --inspect: the folder references must stay in (default: the input's)
     --progress     Report reading and conversion progress on stderr
 -h, --help         Show help
 ```
@@ -51,6 +54,23 @@ A reference may use `..` as long as it stays inside the folder. URLs and symlink
 
 A relative path that leads nowhere, often because an upload or archive lost the folders it names, is looked for by name beside the file containing the reference too, as obj2gltf does. `textures/wall.png` in an MTL finds `wall.png` next to that MTL when there's no `textures` folder. The lookup only checks that one folder for that one name, and the written path always wins when it exists. Files found by name are listed in one counted warning. Two references that mean different paths, such as `a/wall.png` and `b/wall.png`, or `old/wall.png` and `wall.png`, can't both lead to one file this way: which file each meant would be a guess, so the conversion fails. `--exact-paths` turns off every lookup by name, absolute and relative: a reference must then lead to a file exactly where written.
 
+### Checking an upload
+
+`mesh2gltf --inspect FILE` reports the files an `.obj`, `.mtl` or `.ply` refers to, without converting anything or looking for those files, so each file of an upload can be inspected alone, in any order, as it arrives. It prints one JSON object on stdout:
+
+```sh
+$ mesh2gltf --inspect model.mtl
+{"requires":[["textures/diffuse.jpg","diffuse.jpg"],["wall.png"]]}
+```
+
+Each entry of `requires` is one file, given as the paths the conversion will look for it at, in order: relative to the inspected file's folder, with forward slashes, and following the rules above, so `--trusted` and `--exact-paths` change it as they change the conversion. The file is found at the first of these paths that exists. Once every entry has at least one of its paths among the uploaded files, the model's references are complete. Here `C:\Users\bob\wall.png` in the MTL is met by `wall.png` beside it.
+
+A conversion keeps references inside the input's folder, so a library in a folder below it may reach back up with `..`. Inspected alone, that library would take its own folder as the limit. `--root DIR` gives the model's folder instead, which must hold the inspected file: with `scan.obj` naming `mtl/m.mtl`, which names `../tex/d.jpg`, `mesh2gltf --inspect mtl/m.mtl --root .` requires `[["../tex/d.jpg","d.jpg"]]`. Paths stay relative to the inspected file's folder. `--root` doesn't apply to a conversion, nor with `--trusted`.
+
+An OBJ requires the libraries its first `mtllib` names. Exporters write it before any geometry, so reading stops there, and only an OBJ without one is read to the end. An MTL requires the texture of every material it defines, used or not, since the conversion needs them all. A PLY requires its `comment TextureFile`s when it has texture coordinates, and only its header is read. VRML can't be inspected.
+
+A reference the conversion would refuse, such as a URL, or a file the conversion would reject before following its references, such as a PLY point cloud or an unsupported `map_Kd` option, fails the inspection with the conversion's message and exit code. Two references meeting on one file found by name are only detected by the conversion, which can see which files exist.
+
 Messages on stderr can be shown to whoever supplied the model. A file is shown by its name, never its folder, and a reference by what the model wrote. Names from a file are cut to a short length, and characters that could drive a terminal, read as markup or hide text are replaced by `?`. A problem a file repeats gives one warning, with its count and up to three examples, once the file has been read.
 
 ## Exit codes
@@ -59,7 +79,7 @@ Messages on stderr can be shown to whoever supplied the model. A file is shown b
 | ---- | ------- |
 | 0 | Success |
 | 1 | The input was rejected, including an input that isn't `.obj`, `.ply`, `.wrl` or `.vrml`, a PLY without faces (point clouds aren't supported), and a model too large for a `.glb` |
-| 2 | The command line is wrong, including `--images keep` with a `.glb`, or with an output folder that doesn't hold the input's images |
+| 2 | The command line is wrong, including `--inspect` with a conversion option such as `-o`, a `--root` that doesn't hold the input, `--images keep` with a `.glb`, or with an output folder that doesn't hold the input's images |
 | 3 | A resource limit was reached: the disk is full, or a quota or file-size limit |
 | 4 | Another problem with the machine, such as permissions, a missing output directory or an output that already exists |
 | 101 | Internal error (a panic) |

@@ -55,6 +55,8 @@ pub struct References {
     reached: Rc<RefCell<HashMap<PathBuf, Reach>>>,
     /// Reported once every clone is gone, which `run` arranges after the model is read.
     found_by_name: Rc<RefCell<Tally>>,
+    /// For `--inspect`: where each reference would be looked for, in place of following it.
+    listed: Option<Rc<RefCell<Vec<Vec<String>>>>>,
 }
 impl References {
     /// What the model in `dir` may reach, given whether the user has vouched for it, and whether
@@ -69,6 +71,23 @@ impl References {
             by_name,
             ..references
         })
+    }
+    /// Records every reference instead of following it, for `listed`. Nothing is looked up, so
+    /// the files referred to need not exist.
+    pub fn listing(self) -> Self {
+        Self {
+            listed: Some(Rc::default()),
+            ..self
+        }
+    }
+    /// For each reference made so far, the paths it is looked for at, in the order the import
+    /// tries them, relative to the folder of the file that makes it, with forward slashes and `.`
+    /// and `..` applied. The reference is met by the first of these that exists.
+    pub fn listed(&self) -> Vec<Vec<String>> {
+        self.listed
+            .as_ref()
+            .map(|listed| listed.borrow().clone())
+            .unwrap_or_default()
     }
     /// For input the user hasn't vouched for: only regular files beneath `dir` can be reached.
     pub fn confined(dir: &Path) -> io::Result<Self> {
@@ -87,6 +106,7 @@ impl References {
             found_by_name: Rc::new(RefCell::new(Tally::new(
                 "references found by name beside the file that makes them, not at their written path",
             ))),
+            listed: None,
         }
     }
     /// Where `reference`, written in a file in `base`, leads. A URI must be decoded first.
@@ -100,10 +120,28 @@ impl References {
     pub fn resolve(&self, base: &Path, reference: &str) -> Res<PathBuf> {
         let base = non_empty(base);
         let written = reference.replace('\\', "/");
-        // A URL is no path at all, so it has no name to look for.
-        let url = has_prefix(&written) && name_of_absolute(&written).is_none();
-        let name = last_name(&written).filter(|_| self.by_name && !url);
+        if let Some(listed) = &self.listed {
+            // Only the referencing file's folder is looked up, never what the reference names.
+            let depth = match &self.root {
+                Some(root) => fs::canonicalize(base)
+                    .ok()
+                    .and_then(|base| Some(base.strip_prefix(root).ok()?.components().count()))
+                    .ok_or(Refused)?,
+                None => 0,
+            };
+            let (at_written, name) = self.lookups(&written, depth);
+            let mut tries: Vec<String> = at_written
+                .then(|| tidied(&written))
+                .flatten()
+                .into_iter()
+                .collect();
+            tries.extend(name.map(str::to_owned).filter(|name| !tries.contains(name)));
+            let first = tries.first().map(|path| base.join(path)).ok_or(Refused)?;
+            listed.borrow_mut().push(tries);
+            return Ok(first);
+        }
         let Some(root) = &self.root else {
+            let (_, name) = self.lookups(&written, 0);
             // Windows reads the path itself, and `\\\\?\\` only means what it says with backslashes.
             let file = base.join(if cfg!(windows) { reference } else { &written });
             let beside = name
@@ -117,17 +155,14 @@ impl References {
             }
             return Ok(found);
         };
-        // Decided from the text alone, so the path of a refused reference is never looked up.
         let base = fs::canonicalize(base).map_err(|_| Refused)?;
-        let at_written_path = if name_of_absolute(&written).is_some() || !looks_relative(&written) {
-            Err(Refused)
+        let depth = base.strip_prefix(root).map_err(|_| Refused)?;
+        // Decided from the text alone, so the path of a refused reference is never looked up.
+        let (at_written, name) = self.lookups(&written, depth.components().count());
+        let at_written_path = if at_written {
+            regular_file_inside(root, &base.join(&written))
         } else {
-            let depth = base.strip_prefix(root).map_err(|_| Refused)?;
-            if climbs_out(&written, depth.components().count()) {
-                Err(Refused)
-            } else {
-                regular_file_inside(root, &base.join(&written))
-            }
+            Err(Refused)
         };
         let meant = meant(&base, &written);
         match (at_written_path, name) {
@@ -139,6 +174,19 @@ impl References {
             }
             (Err(refused), None) => Err(refused.into()),
         }
+    }
+    /// Where `written`, with forward slashes, in a file `depth` folders below the root, is looked
+    /// for, from its text alone: whether at its written path, and the name to look for beside the
+    /// referencing file, if any.
+    fn lookups<'a>(&self, written: &'a str, depth: usize) -> (bool, Option<&'a str>) {
+        // A URL is no path at all, so it has no name to look for.
+        let url = has_prefix(written) && name_of_absolute(written).is_none();
+        let name = last_name(written).filter(|_| self.by_name && !url);
+        let at_written = self.root.is_none()
+            || (name_of_absolute(written).is_none()
+                && looks_relative(written)
+                && !climbs_out(written, depth));
+        (at_written, name)
     }
     /// Records that `written`, meaning `meant`, leads to `file`, and returns `file`, unless a
     /// reference meaning another path leads there too and either was found by name.
@@ -187,6 +235,26 @@ fn meant(base: &Path, written: &str) -> PathBuf {
         }
     }
     path
+}
+/// `written` as `listed` reports it: `.` and `..` applied as `meant` does, relative to the
+/// referencing file's folder, or as written if it is absolute. `None` if it names no file.
+fn tidied(written: &str) -> Option<String> {
+    if name_of_absolute(written).is_some() || has_prefix(written) {
+        return Some(written.to_owned());
+    }
+    let mut parts = Vec::new();
+    for part in written.split('/') {
+        match part {
+            "" | "." => {}
+            // Only `--trusted` lets a reference climb out, so the climb is kept as written.
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let path = parts.join("/");
+    (!matches!(parts.last(), None | Some(&".."))).then_some(path)
 }
 fn non_empty(dir: &Path) -> &Path {
     if dir.as_os_str().is_empty() {
@@ -507,6 +575,39 @@ mod tests {
         let refs = References::unrestricted();
         let path = refs.resolve(Path::new("base"), "../x\\y.png").unwrap();
         assert_eq!(path, Path::new("base/../x/y.png"));
+    }
+    #[test]
+    fn listing_reports_where_each_reference_is_looked_for_without_looking() {
+        let f = Fixture::new("listing");
+        let listed = |trusted: bool, by_name: bool, reference: &str| {
+            let refs = References::for_input(&f.job(), trusted, by_name)
+                .unwrap()
+                .listing();
+            let found = refs.resolve(&f.job(), reference).ok();
+            let listed = refs.listed();
+            assert_eq!(found.is_some(), !listed.is_empty(), "{reference}");
+            listed.into_iter().next().unwrap_or_default()
+        };
+        let tries = |reference| listed(false, true, reference);
+        assert_eq!(tries("missing.png"), ["missing.png"]);
+        assert_eq!(tries("textures/a.png"), ["textures/a.png", "a.png"]);
+        assert_eq!(tries(".\\tex\\..\\a.png"), ["a.png"]);
+        assert_eq!(tries("C:\\Users\\bob\\a.png"), ["a.png"]);
+        assert_eq!(tries("/home/bob/a.png"), ["a.png"]);
+        assert_eq!(tries("../outside/s.txt"), ["s.txt"]);
+        for nowhere in ["http://x/a.png", "", "tex/..", "C:\\"] {
+            assert!(tries(nowhere).is_empty(), "{nowhere:?}");
+        }
+        assert_eq!(listed(false, false, "textures/a.png"), ["textures/a.png"]);
+        assert!(listed(false, false, "/home/bob/a.png").is_empty());
+        let trusted = |reference| listed(true, true, reference);
+        assert_eq!(trusted("/home/bob/a.png"), ["/home/bob/a.png", "a.png"]);
+        assert_eq!(trusted("../outside/s.txt"), ["../outside/s.txt", "s.txt"]);
+        // Several references meeting on one name aren't for the listing to judge.
+        let refs = References::confined(&f.job()).unwrap().listing();
+        refs.resolve(&f.job(), "a/m.bin").unwrap();
+        refs.resolve(&f.job(), "b/m.bin").unwrap();
+        assert_eq!(refs.listed().len(), 2);
     }
     #[test]
     fn unrestricted_absolute_paths_prefer_what_they_name() {
