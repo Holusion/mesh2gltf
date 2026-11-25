@@ -1600,6 +1600,86 @@ fn help_and_a_second_input() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("Unexpected argument"), "{stderr}");
 }
+#[test]
+fn json_log_lines_and_log_level() {
+    let f = Fixture::new();
+    // One unsupported record: a warning, among the information lines.
+    f.file(
+        "in.obj",
+        "v 0 0 0\nv 1 0 0\nv 0 1 0\ncurv 0 1 1 2\nf 1 2 3\n",
+    );
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
+            .arg(f.0.join("in.obj"))
+            .args(["-o", "out.gltf"])
+            .args(args)
+            .current_dir(&f.0)
+            .output()
+            .unwrap();
+        let _ = fs::remove_file(f.0.join("out.gltf"));
+        let _ = fs::remove_file(f.0.join("out.bin"));
+        (out.status.code(), String::from_utf8(out.stderr).unwrap())
+    };
+    let parsed = |stderr: &str| -> Vec<Value> {
+        let parse = |line| serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        stderr.lines().map(parse).collect()
+    };
+    let (code, stderr) = run(&["--log-format", "json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let lines = parsed(&stderr);
+    let warn = lines.iter().find(|l| l["level"] == "warn").expect(&stderr);
+    assert_eq!(
+        warn,
+        &serde_json::json!({"level": "warn", "message": "unsupported OBJ records omitted: 1, for example curv"})
+    );
+    assert!(lines
+        .iter()
+        .any(|l| l["level"] == "info"
+            && l["message"].as_str().unwrap().starts_with("Wrote out.gltf")));
+    // Fields come in meshtinker's order.
+    assert!(stderr.starts_with(r#"{"level":"#), "{stderr}");
+
+    let (code, stderr) = run(&["--log-level", "warn"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr,
+        "Warning: unsupported OBJ records omitted: 1, for example curv\n"
+    );
+    let (code, stderr) = run(&["--log-level=error", "--log-format=text"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+
+    // A wrong command line is reported in the format asked for, wherever the option is.
+    let (code, stderr) = run(&["--nope", "--log-format", "json"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(
+        stderr,
+        "{\"level\":\"error\",\"message\":\"Unknown option: --nope\",\"code\":\"usage\"}\n"
+    );
+    // A failure names its class, as its exit code does.
+    let (code, stderr) = run(&["--log-format=json", "--images", "keep", "-o", "out.glb"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.ends_with("\"code\":\"usage\"}\n"), "{stderr}");
+    fs::write(f.0.join("bad.obj"), "f 1 2 3\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
+        .args(["bad.obj", "--log-format", "json", "--log-level", "error"])
+        .current_dir(&f.0)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert_eq!(parsed(&stderr)[0]["code"], "rejected", "{stderr}");
+    for (args, message) in [
+        (["--log-level", "warning"], "--log-level must be"),
+        (["--log-format", "JSON"], "--log-format must be"),
+    ] {
+        let (code, stderr) = run(&args);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(
+            stderr.starts_with("Error: ") && stderr.contains(message),
+            "{stderr}"
+        );
+    }
+}
 
 /// A PLY value, written as text or packed in the file's byte order.
 #[derive(Clone, Copy)]

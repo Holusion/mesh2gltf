@@ -411,7 +411,7 @@ fn mesh(input: &Path, reader: &mut impl BufRead, references: &References) -> Res
             materials.push(m);
         }
     } else if !header.textures.is_empty() {
-        crate::say!("Warning: PLY textures omitted: the file has no texture coordinates");
+        crate::warn!("PLY textures omitted: the file has no texture coordinates");
     }
     Ok(Mesh {
         header,
@@ -485,12 +485,14 @@ pub fn spool(
     let mut wedge = Vec::new();
     let mut record = Vec::new();
     let mut done = 0u64;
+    let total = header.elements.iter().map(|e| e.count).sum();
     for (element, roles) in header.elements.iter().zip(&roles) {
         for i in 0..element.count {
             done += 1;
             if progress && done.is_multiple_of(1 << 22) {
                 let read = body.input.stream_position()?;
-                crate::say!("Reading PLY: {}", crate::format::fmt_bytes(read));
+                let message = format!("Reading PLY: {}", crate::format::fmt_bytes(read));
+                crate::diagnostics::progress("read", done, total, &message);
             }
             let result: Res<()> = (|| {
                 let mut position = [0i64; 3];
@@ -613,19 +615,21 @@ pub fn spool(
         fs::remove_dir_all(&uv_dir)?;
     }
     if short_faces > 0 {
-        crate::say!("Warning: omitted {short_faces} faces with fewer than three corners");
+        crate::warn!("omitted {short_faces} faces with fewer than three corners");
     }
     if mismatched_uvs > 0 {
-        crate::say!("Warning: {mismatched_uvs} faces whose texcoord list doesn't match their corners are left untextured");
+        crate::warn!("{mismatched_uvs} faces whose texcoord list doesn't match their corners are left untextured");
     }
     if bad_texnumbers > 0 {
-        crate::say!("Warning: {bad_texnumbers} faces with a texnumber naming no TextureFile are left untextured");
+        crate::warn!(
+            "{bad_texnumbers} faces with a texnumber naming no TextureFile are left untextured"
+        );
     }
     if translucent > 0 && keep_colors {
-        crate::say!("Warning: vertex color alpha is omitted ({translucent} translucent vertices)");
+        crate::warn!("vertex color alpha is omitted ({translucent} translucent vertices)");
     }
     if clamped > 0 && keep_colors {
-        crate::say!("Warning: {clamped} vertex color channels outside [0,1] are clamped");
+        crate::warn!("{clamped} vertex color channels outside [0,1] are clamped");
     }
     for w in [&mut v, &mut vt, &mut vn, &mut faces] {
         w.flush()?;
