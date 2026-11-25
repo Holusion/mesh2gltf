@@ -1630,7 +1630,7 @@ fn json_log_lines_and_log_level() {
     let warn = lines.iter().find(|l| l["level"] == "warn").expect(&stderr);
     assert_eq!(
         warn,
-        &serde_json::json!({"level": "warn", "message": "unsupported OBJ records omitted: 1, for example curv"})
+        &serde_json::json!({"level": "warn", "message": "unsupported OBJ records omitted: 1, for example curv", "code": "unsupported-record"})
     );
     assert!(lines
         .iter()
@@ -1668,6 +1668,20 @@ fn json_log_lines_and_log_level() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert_eq!(parsed(&stderr)[0]["code"], "rejected", "{stderr}");
+    // A warning given directly, not counted by name, has its code too.
+    fs::write(
+        f.0.join("short.obj"),
+        "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2\nf 1 2 3\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mesh2gltf"))
+        .args(["short.obj", "--log-format", "json", "--log-level", "warn"])
+        .current_dir(&f.0)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(parsed(&stderr)[0]["code"], "too-few-corners", "{stderr}");
     for (args, message) in [
         (["--log-level", "warning"], "--log-level must be"),
         (["--log-format", "JSON"], "--log-format must be"),

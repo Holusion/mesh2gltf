@@ -283,8 +283,11 @@ pub fn spool(
     let mut flat = false;
     let mut material = 0u32;
     let mut warned = HashSet::new();
-    let mut unsupported = Tally::new("unsupported OBJ records omitted");
-    let mut undefined = Tally::new("undefined materials, using the default");
+    let mut unsupported = Tally::coded("unsupported-record", "unsupported OBJ records omitted");
+    let mut undefined = Tally::coded(
+        "undefined-material",
+        "undefined materials, using the default",
+    );
     let mut library_warnings = material::Warnings::new();
     let mut short_faces = 0u64;
     let mut record = Vec::new();
@@ -472,7 +475,7 @@ pub fn spool(
         result.with_context(|| location(line))?;
     }
     if short_faces > 0 {
-        crate::warn!("omitted {short_faces} faces with fewer than three corners");
+        crate::warn!(code: "too-few-corners", "omitted {short_faces} faces with fewer than three corners");
     }
     for writer in &mut attrs {
         writer.flush()?;

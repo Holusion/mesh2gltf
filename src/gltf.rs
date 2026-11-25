@@ -478,7 +478,7 @@ fn geometry(
         crate::warn!("generated smooth normals for {repaired_normals} corners with zero-length source normals");
     }
     if skipped_degenerate > 0 {
-        crate::warn!("skipped {skipped_degenerate} faces with zero area");
+        crate::warn!(code: "zero-area-face", "skipped {skipped_degenerate} faces with zero area");
     }
     if forced_polygons > 0 {
         crate::warn!("triangulated {forced_polygons} self-intersecting or otherwise non-simple faces by forced ear clipping; their triangles may overlap");
@@ -597,7 +597,8 @@ fn appearance(
         .collect();
     let mut material_ids = HashMap::new();
     let mut invisible = BTreeSet::new();
-    let mut invisible_names = Tally::new(
+    let mut invisible_names = Tally::coded(
+        "fully-transparent-material",
         "fully transparent materials, which will be invisible (d 0 or Tr 1; check whether the exporter writes Tr as opacity)",
     );
     for &(old_id, textured, colored) in &used_materials {

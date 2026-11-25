@@ -97,7 +97,22 @@ With `--progress`, a long stage reports how far it is about every 100 MB read or
 
 `progress` is the fraction of the stage done, from 0 to 1, and `stage` says which one: `read` (the input), `spool` (the OBJ mesh2gltf writes from a VRML input), `group` (sorting faces by object and material), `smooth` (generating normals) and `write` (the geometry). Stages come in that order, each when the model needs it, and a bar goes back to 0 with each new one. In text, the percentage ends the message.
 
-`level` and `message` are always there; the message is the text line without its `Warning:` or `Error:`, cleaned in the same way. `code` is only on the error that ends a run: `rejected`, `usage`, `resource` or `environment`, as its exit code below, or `internal` for a panic. Other fields may come later, so parsers should ignore those they don't know. Both options are read before the rest of the command line, so a wrong command line is reported in the format asked for.
+`level` and `message` are always there; the message is the text line without its `Warning:` or `Error:`, cleaned in the same way. `code` is a stable code for callers, who can map it to a localized message. The error that ends a run always has one: `rejected`, `usage`, `resource` or `environment`, as its exit code below, or `internal` for a panic. These warnings have one too, and others may get one later:
+
+| Code | Warning |
+| ---- | ------- |
+| `unsupported-record` | An OBJ record mesh2gltf doesn't read, such as `curv` or `l` |
+| `unsupported-property` | An MTL or PLY property mesh2gltf doesn't read, such as an MTL `bump` or a PLY scalar field |
+| `unsupported-element` | A PLY element other than `vertex` and `face`, such as `edge` |
+| `undefined-material` | `usemtl` names a material no library defines |
+| `too-few-corners` | Faces with fewer than three corners: lines and points |
+| `zero-area-face` | Faces with zero area |
+| `missing-texture-coordinates` | Faces with a textured material have no UVs |
+| `textured-vertex-colors` | Faces with both vertex colors and a texture |
+| `fully-transparent-material` | Materials that are fully transparent (`d 0` or `Tr 1`) |
+| `reference-path-not-found` | References that lead to no file at their written path |
+
+A code names the problem, not what mesh2gltf does about it, which the message says: the same code can come from several formats, and keeps its meaning if the handling changes.
 
 ## Exit codes
 

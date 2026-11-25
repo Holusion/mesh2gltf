@@ -365,8 +365,10 @@ struct Mesh {
 /// textures with `references`.
 fn mesh(input: &Path, reader: &mut impl BufRead, references: &References) -> Res<Mesh> {
     let header = header(reader).with_context(|| shown(input))?;
-    let mut unsupported = Tally::new("unsupported PLY properties omitted");
-    let mut other_elements = Tally::new("unsupported PLY elements omitted");
+    let mut unsupported =
+        Tally::coded("unsupported-property", "unsupported PLY properties omitted");
+    let mut other_elements =
+        Tally::coded("unsupported-element", "unsupported PLY elements omitted");
     let reject = |message: &str| -> Failure { format!("{}: {message}", shown(input)).into() };
     let elements = &header.elements;
     let find = |name: &'static str| elements.iter().filter(move |e| e.name == name);
@@ -615,7 +617,7 @@ pub fn spool(
         fs::remove_dir_all(&uv_dir)?;
     }
     if short_faces > 0 {
-        crate::warn!("omitted {short_faces} faces with fewer than three corners");
+        crate::warn!(code: "too-few-corners", "omitted {short_faces} faces with fewer than three corners");
     }
     if mismatched_uvs > 0 {
         crate::warn!("{mismatched_uvs} faces whose texcoord list doesn't match their corners are left untextured");

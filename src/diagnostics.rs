@@ -72,9 +72,13 @@ macro_rules! info {
         $crate::diagnostics::log($crate::diagnostics::Level::Info, &format!($($arg)*), None)
     };
 }
-/// Writes a `warn` message: data omitted or changed, the conversion going on.
+/// Writes a `warn` message: data omitted or changed, the conversion going on. A warning a caller
+/// may want to tell apart starts with `code: "kebab-case",`, a stable code listed in the README.
 #[macro_export]
 macro_rules! warn {
+    (code: $code:literal, $($arg:tt)*) => {
+        $crate::diagnostics::log($crate::diagnostics::Level::Warn, &format!($($arg)*), Some($code))
+    };
     ($($arg:tt)*) => {
         $crate::diagnostics::log($crate::diagnostics::Level::Warn, &format!($($arg)*), None)
     };
@@ -185,6 +189,7 @@ pub fn safe(text: &str) -> String {
 /// It holds no more than those, so it doesn't grow with the file. It reports when dropped, so that
 /// what was found still shows if the import then fails.
 pub struct Tally {
+    code: Option<&'static str>,
     what: &'static str,
     count: u64,
     examples: Vec<String>,
@@ -193,10 +198,17 @@ impl Tally {
     /// `what` comes before the count: "undefined materials".
     pub fn new(what: &'static str) -> Self {
         Self {
+            code: None,
             what,
             count: 0,
             examples: Vec::new(),
         }
+    }
+    /// A tally whose warning has a stable `code`, listed in the README.
+    pub fn coded(code: &'static str, what: &'static str) -> Self {
+        let mut tally = Self::new(what);
+        tally.code = Some(code);
+        tally
     }
     /// `example` may come from the file.
     pub fn add(&mut self, example: &str) {
@@ -220,7 +232,7 @@ impl Tally {
 impl Drop for Tally {
     fn drop(&mut self) {
         if let Some(message) = self.message() {
-            log(Level::Warn, &message, None);
+            log(Level::Warn, &message, self.code);
         }
     }
 }

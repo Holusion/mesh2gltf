@@ -99,10 +99,10 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
         groups[id].bytes += 12 + 24 * corners.len() as u64;
     }
     if untextured > 0 {
-        crate::warn!("{untextured} faces with a textured material have no UVs; they use an untextured copy of it");
+        crate::warn!(code: "missing-texture-coordinates", "{untextured} faces with a textured material have no UVs; they use an untextured copy of it");
     }
     if hidden_colors > 0 {
-        crate::warn!("vertex colors on {hidden_colors} textured faces are dropped, since the texture replaces them");
+        crate::warn!(code: "textured-vertex-colors", "vertex colors on {hidden_colors} textured faces are dropped, since the texture replaces them");
     }
     if !interleaved {
         return Ok(groups);
