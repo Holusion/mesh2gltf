@@ -1,6 +1,6 @@
 [package]
 name = "mesh2gltf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Disk-backed OBJ, PLY and VRML importer for georeferenced glTF assets"
 readme = "README.md"
