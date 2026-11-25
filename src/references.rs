@@ -103,7 +103,8 @@ impl References {
             root,
             by_name: true,
             reached: Rc::default(),
-            found_by_name: Rc::new(RefCell::new(Tally::new(
+            found_by_name: Rc::new(RefCell::new(Tally::coded(
+                "reference-path-not-found",
                 "references found by name beside the file that makes them, not at their written path",
             ))),
             listed: None,

@@ -88,7 +88,7 @@ fn floats(rest: &str, count: usize) -> Res<Vec<f64>> {
 }
 fn warn_once(warned: &mut HashSet<&'static str>, key: &'static str, message: &str) {
     if warned.insert(key) {
-        crate::say!("Warning: {message}");
+        crate::warn!("{message}");
     }
 }
 /// One OBJ statement: the line it starts on, its keyword as written and lowercased, and the rest.
@@ -103,7 +103,8 @@ struct Statement<'a> {
 struct Statements<'a> {
     reader: BufReader<File>,
     location: &'a dyn Fn(usize) -> String,
-    progress: bool,
+    /// With `--progress`: the stage it reports, and the file's size.
+    progress: Option<(&'static str, u64)>,
     line: String,
     /// A statement continued over several lines.
     joined: String,
@@ -114,8 +115,16 @@ struct Statements<'a> {
     eof: bool,
 }
 impl<'a> Statements<'a> {
-    fn open(source: &Path, progress: bool, location: &'a dyn Fn(usize) -> String) -> Res<Self> {
+    fn open(
+        source: &Path,
+        stage: Option<&'static str>,
+        location: &'a dyn Fn(usize) -> String,
+    ) -> Res<Self> {
         let file = File::open(source).with_context(|| shown(source))?;
+        let progress = match stage {
+            Some(stage) => Some((stage, file.metadata()?.len())),
+            None => None,
+        };
         Ok(Self {
             reader: BufReader::with_capacity(256 * 1024, file),
             location,
@@ -151,11 +160,11 @@ impl<'a> Statements<'a> {
                 self.bytes += size;
                 self.line_no += 1;
             }
-            if self.progress && self.bytes >= self.next_progress {
-                crate::say!(
-                    "Spooling OBJ: {}",
-                    crate::format::fmt_bytes(self.bytes as u64)
-                );
+            if let Some((stage, size)) = self.progress.filter(|_| self.bytes >= self.next_progress)
+            {
+                let read = self.bytes as u64;
+                let message = format!("Spooling OBJ: {}", crate::format::fmt_bytes(read));
+                crate::diagnostics::progress(stage, read, size, &message);
                 self.next_progress = self.bytes + 100_000_000;
             }
             let stripped = self.line.split('#').next().unwrap().trim();
@@ -274,12 +283,20 @@ pub fn spool(
     let mut flat = false;
     let mut material = 0u32;
     let mut warned = HashSet::new();
-    let mut unsupported = Tally::new("unsupported OBJ records omitted");
-    let mut undefined = Tally::new("undefined materials, using the default");
+    let mut unsupported = Tally::coded("unsupported-record", "unsupported OBJ records omitted");
+    let mut undefined = Tally::coded(
+        "undefined-material",
+        "undefined materials, using the default",
+    );
     let mut library_warnings = material::Warnings::new();
     let mut short_faces = 0u64;
     let mut record = Vec::new();
-    let mut statements = Statements::open(source, progress, &location)?;
+    // A generated OBJ is a second pass over the input, so its bar is a stage of its own.
+    let stage = match origin {
+        Origin::Model => "read",
+        Origin::GeneratedFrom(_) => "spool",
+    };
+    let mut statements = Statements::open(source, progress.then_some(stage), &location)?;
     while let Some(Statement {
         line,
         written,
@@ -458,7 +475,7 @@ pub fn spool(
         result.with_context(|| location(line))?;
     }
     if short_faces > 0 {
-        crate::say!("Warning: omitted {short_faces} faces with fewer than three corners");
+        crate::warn!(code: "too-few-corners", "omitted {short_faces} faces with fewer than three corners");
     }
     for writer in &mut attrs {
         writer.flush()?;
@@ -482,7 +499,7 @@ pub fn spool(
 /// without one is read to the end.
 pub fn inspect(source: &Path, references: &References) -> Res<()> {
     let location = |line: usize| format!("{}:{line}", shown(source));
-    let mut statements = Statements::open(source, false, &location)?;
+    let mut statements = Statements::open(source, None, &location)?;
     while let Some(statement) = statements.next()? {
         if statement.key == "mtllib" {
             let parent = source.parent().unwrap_or(Path::new("."));

@@ -36,7 +36,10 @@ pub type Res<T> = Result<T, Failure>;
 
 fn main() -> ExitCode {
     diagnostics::report_panics();
-    let result = match cli::parse(env::args().skip(1)) {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let (threshold, format) = cli::log_settings(&args);
+    diagnostics::configure(threshold, format);
+    let result = match cli::parse(args.into_iter()) {
         Ok(Some(options)) => run(options),
         Ok(None) => Ok(()),
         Err(e) => Err(failure::Usage(e).into()),
@@ -44,8 +47,10 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            crate::say!("Error: {e}");
-            ExitCode::from(failure::classify(&*e) as u8)
+            let class = failure::classify(&*e);
+            let message = e.to_string();
+            diagnostics::log(diagnostics::Level::Error, &message, Some(class.code()));
+            ExitCode::from(class as u8)
         }
     }
 }

@@ -12,7 +12,13 @@ use std::{
     path::Path,
 };
 
-pub fn generate(scene: &Scene, positions: &[u8], dir: &Path, progress: bool) -> Res<MmapMut> {
+/// `progress` is the number of faces, for `--progress`.
+pub fn generate(
+    scene: &Scene,
+    positions: &[u8],
+    dir: &Path,
+    progress: Option<u64>,
+) -> Res<MmapMut> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -65,8 +71,9 @@ pub fn generate(scene: &Scene, positions: &[u8], dir: &Path, progress: bool) -> 
                 }
             }
         }
-        if progress && count.is_multiple_of(1_000_000) {
-            crate::say!("Smoothing: accumulated {count} faces");
+        if let Some(total) = progress.filter(|_| count.is_multiple_of(1_000_000)) {
+            let message = format!("Smoothing: accumulated {count} faces");
+            crate::diagnostics::progress("smooth", count, total, &message);
         }
     }
     Ok(sums)

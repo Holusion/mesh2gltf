@@ -51,6 +51,7 @@ pub fn key(scene: &Scene, colors: Option<&[u8]>, face: &Face) -> Res<(Key, bool)
     Ok((key, has_colors && textured))
 }
 pub struct Group {
+    pub faces: u64,
     pub corners: u64,
     bytes: u64,
 }
@@ -83,6 +84,7 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
         hidden_colors += u64::from(hidden);
         let id = *keys.entry(key).or_insert_with(|| {
             groups.push(Group {
+                faces: 0,
                 corners: 0,
                 bytes: 0,
             });
@@ -92,20 +94,21 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
             interleaved |= groups[id].bytes > 0;
             current = id;
         }
+        groups[id].faces += 1;
         groups[id].corners += corners.len() as u64;
         groups[id].bytes += 12 + 24 * corners.len() as u64;
     }
     if untextured > 0 {
-        crate::say!("Warning: {untextured} faces with a textured material have no UVs; they use an untextured copy of it");
+        crate::warn!(code: "missing-texture-coordinates", "{untextured} faces with a textured material have no UVs; they use an untextured copy of it");
     }
     if hidden_colors > 0 {
-        crate::say!("Warning: vertex colors on {hidden_colors} textured faces are dropped, since the texture replaces them");
+        crate::warn!(code: "textured-vertex-colors", "vertex colors on {hidden_colors} textured faces are dropped, since the texture replaces them");
     }
     if !interleaved {
         return Ok(groups);
     }
     if progress {
-        crate::say!("Grouping {count} faces by object and material");
+        crate::info!("Grouping {count} faces by object and material");
     }
     let sorted_path = dir.join("faces-grouped");
     let file = OpenOptions::new()
@@ -125,7 +128,13 @@ pub fn group(scene: &Scene, dir: &Path, progress: bool) -> Res<Vec<Group>> {
     }
     let mut faces = BufReader::with_capacity(256 * 1024, File::open(&path)?);
     let mut record = Vec::new();
+    let mut done = 0u64;
     while let Some(face) = obj::read_face(&mut faces)? {
+        done += 1;
+        if progress && done.is_multiple_of(1_000_000) {
+            let message = format!("Grouping: moved {done} faces");
+            crate::diagnostics::progress("group", done, count, &message);
+        }
         let id = keys[&key(scene, colors.as_deref(), &face)?.0];
         record.clear();
         obj::encode_face(

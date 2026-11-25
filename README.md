@@ -25,19 +25,22 @@ A conversion writes a `.gltf` file, a sibling `.bin` geometry buffer and any cop
 mesh2gltf [OPTIONS] <file.obj|file.ply|file.wrl|file.vrml>
 mesh2gltf --inspect [--root DIR] [--trusted] [--exact-paths] <file.obj|file.mtl|file.ply>
 
--o, --output FILE  Destination .gltf, or .glb (default: input with .gltf extension)
-    --center       Move the bounding-box center to 0, dropping the model's position
-    --up-axis AXIS Source up axis: y (default) or z
-    --tmp-dir DIR  Workspace directory (default: the output's directory)
-    --keep-tmp     Preserve the workspace for debugging
-    --images MODE  auto (default), keep or copy; a .glb embeds them
-    --no-color     Ignore vertex colors, keeping the material color on untextured faces
-    --trusted      Let the model refer to files outside its folder
-    --exact-paths  Follow references only to their written path, never by name
-    --inspect      Print, as JSON, the files an .obj, .mtl or .ply refers to; convert nothing
-    --root DIR     With --inspect: the folder references must stay in (default: the input's)
-    --progress     Report reading and conversion progress on stderr
--h, --help         Show help
+-o, --output FILE      Destination .gltf, or .glb (default: input with .gltf extension)
+    --center           Move the bounding-box center to 0, dropping the model's position
+    --up-axis AXIS     Source up axis: y (default) or z
+    --tmp-dir DIR      Workspace directory (default: the output's directory)
+    --keep-tmp         Preserve the workspace for debugging
+    --images MODE      auto (default), keep or copy; a .glb embeds them
+    --no-color         Ignore vertex colors, keeping the material color on untextured faces
+    --trusted          Let the model refer to files outside its folder
+    --exact-paths      Follow references only to their written path, never by name
+    --inspect          Print, as JSON, the files an .obj, .mtl or .ply refers to; convert nothing
+    --root DIR         With --inspect: the folder references must stay in (default: the input's)
+    --progress         Report reading and conversion progress on stderr
+    --log-level LEVEL  Print stderr messages of this level and above: trace, debug, info
+                       (default), warn or error
+    --log-format FMT   Write stderr messages as text (default), or as JSON lines
+-h, --help             Show help
 ```
 
 Without arguments, mesh2gltf prints this help.
@@ -72,6 +75,44 @@ An OBJ requires the libraries its first `mtllib` names. Exporters write it befor
 A reference the conversion would refuse, such as a URL, or a file the conversion would reject before following its references, such as a PLY point cloud or an unsupported `map_Kd` option, fails the inspection with the conversion's message and exit code. Two references meeting on one file found by name are only detected by the conversion, which can see which files exist.
 
 Messages on stderr can be shown to whoever supplied the model. A file is shown by its name, never its folder, and a reference by what the model wrote. Names from a file are cut to a short length, and characters that could drive a terminal, read as markup or hide text are replaced by `?`. A problem a file repeats gives one warning, with its count and up to three examples, once the file has been read.
+
+## Logs
+
+Data goes to stdout (only `--inspect` writes any), and every message to stderr: what the conversion did, its progress with `--progress`, counted warnings, and the error that ends a failed run. `--log-level` and `--log-format` take meshtinker's values, so that a caller running both can pass the same ones and read both the same way:
+
+- `--log-level <trace|debug|info|warn|error>` prints messages of this level and above; the default is `info`. These are eCorpus's task log levels. mesh2gltf writes only `info`, `warn` and `error` messages, so `trace` and `debug` show what `info` does. `warn` keeps warnings and the error, and `error` only the error.
+- `--log-format json` writes each message as one JSON object per line:
+
+```json
+{"level":"info","message":"Wrote model.gltf (1 triangles, 1 meshes, 80 bytes of geometry)"}
+{"level":"warn","message":"unsupported OBJ records omitted: 1, for example curv"}
+{"level":"error","message":"Output .gltf, .glb or .bin already exists; choose a new output path","code":"environment"}
+```
+
+With `--progress`, a long stage reports how far it is about every 100 MB read or million faces, as an `info` message with two more fields, so that a caller can show a bar per stage rather than print each line:
+
+```json
+{"level":"info","message":"Converted 2000000 faces, 159999984 binary bytes (40%)","progress":0.4,"stage":"write"}
+```
+
+`progress` is the fraction of the stage done, from 0 to 1, and `stage` says which one: `read` (the input), `spool` (the OBJ mesh2gltf writes from a VRML input), `group` (sorting faces by object and material), `smooth` (generating normals) and `write` (the geometry). Stages come in that order, each when the model needs it, and a bar goes back to 0 with each new one. In text, the percentage ends the message.
+
+`level` and `message` are always there; the message is the text line without its `Warning:` or `Error:`, cleaned in the same way. `code` is a stable code for callers, who can map it to a localized message. The error that ends a run always has one: `rejected`, `usage`, `resource` or `environment`, as its exit code below, or `internal` for a panic. These warnings have one too, and others may get one later:
+
+| Code | Warning |
+| ---- | ------- |
+| `unsupported-record` | An OBJ record mesh2gltf doesn't read, such as `curv` or `l` |
+| `unsupported-property` | An MTL or PLY property mesh2gltf doesn't read, such as an MTL `bump` or a PLY scalar field |
+| `unsupported-element` | A PLY element other than `vertex` and `face`, such as `edge` |
+| `undefined-material` | `usemtl` names a material no library defines |
+| `too-few-corners` | Faces with fewer than three corners: lines and points |
+| `zero-area-face` | Faces with zero area |
+| `missing-texture-coordinates` | Faces with a textured material have no UVs |
+| `textured-vertex-colors` | Faces with both vertex colors and a texture |
+| `fully-transparent-material` | Materials that are fully transparent (`d 0` or `Tr 1`) |
+| `reference-path-not-found` | References that lead to no file at their written path |
+
+A code names the problem, not what mesh2gltf does about it, which the message says: the same code can come from several formats, and keeps its meaning if the handling changes.
 
 ## Exit codes
 

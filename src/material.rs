@@ -255,7 +255,7 @@ pub struct Warnings {
 impl Warnings {
     pub fn new() -> Self {
         Self {
-            properties: Tally::new("unsupported MTL properties ignored"),
+            properties: Tally::coded("unsupported-property", "unsupported MTL properties ignored"),
             options: Tally::new("unsupported map_Kd options ignored"),
         }
     }

@@ -17,6 +17,17 @@ pub enum Class {
     /// Anything else about the machine: permissions, I/O errors, the job's directories.
     Environment = 4,
 }
+impl Class {
+    /// The `code` of the failure's JSON log line, which names the class as the exit code does.
+    pub fn code(self) -> &'static str {
+        match self {
+            Class::Rejected => "rejected",
+            Class::Usage => "usage",
+            Class::Resource => "resource",
+            Class::Environment => "environment",
+        }
+    }
+}
 /// Finds the cause of an error along its chain. Errors with no I/O cause come from checking the
 /// input, so they are rejections.
 pub fn classify(error: &(dyn Error + 'static)) -> Class {

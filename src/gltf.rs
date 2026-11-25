@@ -182,26 +182,27 @@ fn write_with_limit(
     } else {
         ([0; 3], false)
     };
-    crate::say!("Origin: {}", format_triple(origin));
-    crate::say!(
+    crate::info!("Origin: {}", format_triple(origin));
+    crate::info!(
         "Bounds: {} (size {})",
         scene.bbox.range_str().unwrap_or_default(),
         scene.bbox.size_str().unwrap_or_default()
     );
     let max_corners = groups.iter().map(|g| g.corners).max().unwrap_or(0);
+    let faces = groups.iter().map(|g| g.faces).sum();
     let mut document = geometry(
         &scene,
         max_corners,
         origin,
         dir,
-        options.progress,
+        options.progress.then_some(faces),
         max_vertices,
     )?;
     if document.offset == 0 {
         return Err("Input contains no supported triangle geometry".into());
     }
     if translated {
-        crate::say!("Note: the model is far from 0 for its size; positions are relative to the origin, which each node's translation restores (--center drops it)");
+        crate::info!("Note: the model is far from 0 for its size; positions are relative to the origin, which each node's translation restores (--center drops it)");
     }
     let transparent = transparency
         .join()
@@ -282,7 +283,7 @@ fn write_with_limit(
         drop(dst);
     }
     outputs.commit();
-    crate::say!(
+    crate::info!(
         "Wrote {} ({} triangles, {mesh_count} meshes, {} bytes of geometry)",
         shown(output),
         document.triangles,
@@ -297,7 +298,8 @@ fn geometry(
     max_corners: u64,
     origin: [i64; 3],
     dir: &Path,
-    progress: bool,
+    // The number of faces, for `--progress`.
+    progress: Option<u64>,
     max_vertices: u64,
 ) -> Res<Document> {
     let attrs = [
@@ -458,27 +460,28 @@ fn geometry(
             p.triangles += 1;
         }
         open = Some(p);
-        if progress && face_count.is_multiple_of(1_000_000) {
-            crate::say!(
+        if let Some(total) = progress.filter(|_| face_count.is_multiple_of(1_000_000)) {
+            let message = format!(
                 "Converted {face_count} faces, {} binary bytes",
                 document.offset
             );
+            crate::diagnostics::progress("write", face_count, total, &message);
         }
     }
     if let Some(p) = open.take() {
         document.close(p, &mut binary)?;
     }
     if splits > 0 {
-        crate::say!("Warning: {splits} primitives reached the {max_vertices}-vertex limit of 32-bit indices and were split");
+        crate::warn!("{splits} primitives reached the {max_vertices}-vertex limit of 32-bit indices and were split");
     }
     if repaired_normals > 0 {
-        crate::say!("Warning: generated smooth normals for {repaired_normals} corners with zero-length source normals");
+        crate::warn!("generated smooth normals for {repaired_normals} corners with zero-length source normals");
     }
     if skipped_degenerate > 0 {
-        crate::say!("Warning: skipped {skipped_degenerate} faces with zero area");
+        crate::warn!(code: "zero-area-face", "skipped {skipped_degenerate} faces with zero area");
     }
     if forced_polygons > 0 {
-        crate::say!("Warning: triangulated {forced_polygons} self-intersecting or otherwise non-simple faces by forced ear clipping; their triangles may overlap");
+        crate::warn!("triangulated {forced_polygons} self-intersecting or otherwise non-simple faces by forced ear clipping; their triangles may overlap");
     }
     binary.flush()?;
     Ok(document)
@@ -594,7 +597,8 @@ fn appearance(
         .collect();
     let mut material_ids = HashMap::new();
     let mut invisible = BTreeSet::new();
-    let mut invisible_names = Tally::new(
+    let mut invisible_names = Tally::coded(
+        "fully-transparent-material",
         "fully transparent materials, which will be invisible (d 0 or Tr 1; check whether the exporter writes Tr as opacity)",
     );
     for &(old_id, textured, colored) in &used_materials {
